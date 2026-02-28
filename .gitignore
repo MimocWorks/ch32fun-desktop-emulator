@@ -1,0 +1,7 @@
+# Zig build outputs
+.zig-cache/
+zig-out/
+
+# Local environment files
+.DS_Store
+Thumbs.db
