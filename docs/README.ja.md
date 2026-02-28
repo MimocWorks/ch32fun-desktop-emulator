@@ -1,8 +1,12 @@
 # CH32fun Desktop Emulator
 
-[English README](README.md)
+[English README](../README.md)
 
 CH32fun ベースのファームウェア ELF をデスクトップ上で実行するためのエミュレータです。ファームウェアイメージを読み込み、CPU と周辺バスをエミュレーションし、SSD1306 風 OLED の表示内容を SDL3 + Vulkan でウィンドウ表示します。
+
+## デモ
+
+![CH32fun Desktop Emulator のデモ](emu_demo.gif)
 
 ## 機能
 
@@ -76,7 +80,7 @@ zig build probe
 
 ## 補助スクリプト
 
-[`tools/run-mopeck.sh`](tools/run-mopeck.sh) は、関連する Mopeck ファームウェアプロジェクトをビルドしてから、このエミュレータを起動します。
+[`tools/run-mopeck.sh`](../tools/run-mopeck.sh) は、関連する Mopeck ファームウェアプロジェクトをビルドしてから、このエミュレータを起動します。
 
 ```sh
 tools/run-mopeck.sh

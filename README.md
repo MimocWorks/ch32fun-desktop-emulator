@@ -1,8 +1,12 @@
 # CH32fun Desktop Emulator
 
-[日本語版 README](README.ja.md)
+[日本語版 README](docs/README.ja.md)
 
 Desktop emulator for a CH32fun-based firmware ELF. The project loads a firmware image, emulates the CPU and peripheral bus, and renders the SSD1306-style OLED output in a desktop window using SDL3 and Vulkan.
+
+## Demo
+
+![CH32fun Desktop Emulator demo](docs/emu_demo.gif)
 
 ## Features
 
