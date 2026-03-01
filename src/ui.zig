@@ -301,6 +301,27 @@ pub const Ui = struct {
         var ext_count: c.Uint32 = 0;
         const ext_names = c.SDL_Vulkan_GetInstanceExtensions(&ext_count) orelse return error.SdlExtensionsFailed;
 
+        // macOS requires portability enumeration extension
+        const builtin = @import("builtin");
+        const is_macos = builtin.os.tag == .macos;
+
+        // Build extension list with portability enumeration for macOS
+        const extensions_buf = try self.allocator.alloc([*:0]const u8, ext_count + 1);
+        defer self.allocator.free(extensions_buf);
+
+        // Copy SDL-required extensions
+        var i: usize = 0;
+        while (i < ext_count) : (i += 1) {
+            extensions_buf[i] = ext_names[i];
+        }
+
+        // Add portability enumeration for macOS
+        var final_ext_count = ext_count;
+        if (is_macos) {
+            extensions_buf[ext_count] = "VK_KHR_portability_enumeration";
+            final_ext_count += 1;
+        }
+
         const app_info = c.VkApplicationInfo{
             .sType = c.VK_STRUCTURE_TYPE_APPLICATION_INFO,
             .pNext = null,
@@ -311,15 +332,17 @@ pub const Ui = struct {
             .apiVersion = c.VK_API_VERSION_1_0,
         };
 
+        const create_flags: c.VkInstanceCreateFlags = if (is_macos) 0x00000001 else 0; // VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR
+
         const create_info = c.VkInstanceCreateInfo{
             .sType = c.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
             .pNext = null,
-            .flags = 0,
+            .flags = create_flags,
             .pApplicationInfo = &app_info,
             .enabledLayerCount = 0,
             .ppEnabledLayerNames = null,
-            .enabledExtensionCount = ext_count,
-            .ppEnabledExtensionNames = ext_names,
+            .enabledExtensionCount = final_ext_count,
+            .ppEnabledExtensionNames = extensions_buf.ptr,
         };
         try vkCheck(c.vkCreateInstance(&create_info, null, &self.instance));
     }

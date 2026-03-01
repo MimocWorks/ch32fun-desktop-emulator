@@ -45,7 +45,13 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    run_cmd.setEnvironmentVariable("SDL_VIDEODRIVER", "x11");
+    // Use cocoa for macOS, x11 for Linux
+    const is_macos = target.result.os.tag == .macos;
+    if (is_macos) {
+        run_cmd.setEnvironmentVariable("SDL_VIDEODRIVER", "cocoa");
+    } else {
+        run_cmd.setEnvironmentVariable("SDL_VIDEODRIVER", "x11");
+    }
     if (b.args) |args| run_cmd.addArgs(args);
 
     const run_step = b.step("run", "Run the desktop emulator");
@@ -66,7 +72,12 @@ pub fn build(b: *std.Build) void {
 
     const run_probe = b.addRunArtifact(probe);
     run_probe.step.dependOn(b.getInstallStep());
-    run_probe.setEnvironmentVariable("SDL_VIDEODRIVER", "x11");
+    // Use cocoa for macOS, x11 for Linux
+    if (is_macos) {
+        run_probe.setEnvironmentVariable("SDL_VIDEODRIVER", "cocoa");
+    } else {
+        run_probe.setEnvironmentVariable("SDL_VIDEODRIVER", "x11");
+    }
     const probe_step = b.step("probe", "Run a minimal SDL window probe");
     probe_step.dependOn(&run_probe.step);
 }
