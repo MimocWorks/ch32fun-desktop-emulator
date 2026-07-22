@@ -20,18 +20,24 @@ pub const Cpu = struct {
     }
 
     pub fn step(self: *Cpu, bus: *Bus) !void {
-        const half = try bus.fetch16(self.pc);
+        // A single 32-bit fetch covers both standard and compressed
+        // instructions and avoids reading the first halfword twice.
+        const inst = try bus.fetchInstruction(self.pc);
+        const half: u16 = @truncate(inst);
         const cycles: u64 = estimateCycles(half);
         bus.cpu_cycles = self.cycle_count;
         if ((half & 0b11) != 0b11) {
             try self.execCompressed(bus, half);
         } else {
-            const inst = try bus.fetch32(self.pc);
             try self.exec32(bus, inst);
         }
         self.regs[0] = 0;
         self.instruction_count += 1;
         self.cycle_count += cycles;
+        if (bus.stall_until_cycle) |target| {
+            if (target > self.cycle_count) self.cycle_count = target;
+            bus.stall_until_cycle = null;
+        }
         bus.cpu_cycles = self.cycle_count;
     }
 

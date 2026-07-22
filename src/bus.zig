@@ -160,6 +160,10 @@ const I2cRegs = struct {
 pub const Bus = struct {
     io: ?std.Io = null,
     cpu_cycles: u64 = 0,
+    // MMIO devices can request that the CPU advance directly to the cycle at
+    // which a polled condition changes. This avoids interpreting thousands of
+    // iterations of a firmware busy-wait without changing device timing.
+    stall_until_cycle: ?u64 = null,
     flash: [flash_size]u8 = [_]u8{0} ** flash_size,
     ram: [ram_size]u8 = [_]u8{0} ** ram_size,
     rcc: RccRegs = .{},
@@ -194,6 +198,15 @@ pub const Bus = struct {
 
     pub fn fetch32(self: *Bus, address: u32) !u32 {
         return @as(u32, @intCast(try self.readInt(u32, address)));
+    }
+
+    pub fn fetchInstruction(self: *Bus, address: u32) !u32 {
+        if (address >= flash_base and address + 2 <= flash_base + flash_size) {
+            const offset: usize = @intCast(address - flash_base);
+            if (offset + 4 <= self.flash.len) return readNativeInt(u32, self.flash[offset .. offset + 4]);
+            return readNativeInt(u16, self.flash[offset .. offset + 2]);
+        }
+        return self.fetch32(address);
     }
 
     pub fn read8(self: *Bus, address: u32) !u8 {
@@ -274,6 +287,9 @@ pub const Bus = struct {
         if (address >= i2c1_base and address < i2c1_base + 32) {
             self.updateI2cStatus();
             const offset = address - i2c1_base;
+            if (offset == 20 and self.i2c.ready_star1 != 0 and self.cpu_cycles < self.i2c.ready_cycle) {
+                self.stall_until_cycle = self.i2c.ready_cycle;
+            }
             return switch (offset) {
                 0 => castRead(T, self.i2c.ctlr1),
                 4 => castRead(T, self.i2c.ctlr2),
@@ -469,4 +485,21 @@ fn readNativeInt(comptime T: type, bytes: []const u8) T {
 fn writeNativeInt(comptime T: type, bytes: []u8, value: T) void {
     const src = std.mem.asBytes(&value);
     @memcpy(bytes[0..@sizeOf(T)], src);
+}
+
+test "instruction fetch supports compressed instruction at flash end" {
+    var bus = Bus{};
+    bus.flash[flash_size - 2] = 0x34;
+    bus.flash[flash_size - 1] = 0x12;
+    try std.testing.expectEqual(@as(u32, 0x1234), try bus.fetchInstruction(flash_base + flash_size - 2));
+}
+
+test "polling pending I2C status requests virtual clock advance" {
+    var bus = Bus{};
+    bus.cpu_cycles = 100;
+    bus.i2c.ready_star1 = i2c_star1_txe;
+    bus.i2c.ready_cycle = 532;
+
+    try std.testing.expectEqual(@as(u16, 0), try bus.read16(i2c1_base + 20));
+    try std.testing.expectEqual(@as(?u64, 532), bus.stall_until_cycle);
 }

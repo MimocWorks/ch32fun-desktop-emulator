@@ -5,6 +5,10 @@ const bus_mod = @import("bus.zig");
 const ui_mod = @import("ui.zig");
 
 const core_clock_hz: u64 = 48_000_000;
+// Terminal input does not need to be polled for every CPU execution slice.
+// 120 Hz keeps added latency below one display frame while avoiding hundreds
+// of relatively expensive PTY poll syscalls per second on macOS.
+const input_poll_interval_ns: u64 = std.time.ns_per_s / 120;
 
 const RuntimeOptions = struct {
     // Roughly 1 ms of emulated work. Larger slices avoid thousands of short
@@ -60,6 +64,7 @@ const Emulator = struct {
         const frame_interval_ns = self.options.target_frame_ns;
         const clock_start_ns = nowNs(self.io);
         var next_present_ns = clock_start_ns;
+        var next_input_poll_ns = clock_start_ns;
         var stats_last_ns = next_present_ns;
         var stats_last_snapshot = self.statsSnapshot();
 
@@ -70,8 +75,12 @@ const Emulator = struct {
         }
 
         while (true) {
+            const loop_start_ns = nowNs(self.io);
             if (self.ui) |*ui| {
-                if (!ui.pumpEvents(&self.bus)) break;
+                if (loop_start_ns >= next_input_poll_ns) {
+                    if (!ui.pumpEvents(&self.bus)) break;
+                    next_input_poll_ns = loop_start_ns + input_poll_interval_ns;
+                }
             }
 
             var steps: usize = 0;
