@@ -4,10 +4,15 @@ const cpu_mod = @import("cpu.zig");
 const bus_mod = @import("bus.zig");
 const ui_mod = @import("ui.zig");
 
+const core_clock_hz: u64 = 48_000_000;
+
 const RuntimeOptions = struct {
-    cpu_slice_steps: usize = 1_000,
+    // Roughly 1 ms of emulated work. Larger slices avoid thousands of short
+    // sleeps and clock syscalls per second while keeping input responsive.
+    cpu_slice_steps: usize = 50_000,
     target_frame_ns: u64 = std.time.ns_per_s / 60,
     enable_stats: bool = false,
+    graphics_protocol: ui_mod.Protocol = .auto,
 };
 
 const StatsSnapshot = struct {
@@ -15,6 +20,7 @@ const StatsSnapshot = struct {
     ui_frames_presented: u64 = 0,
     ui_texture_uploads: u64 = 0,
     ui_acquire_timeout_count: u64 = 0,
+    ui_bytes_written: u64 = 0,
 };
 
 const Emulator = struct {
@@ -23,17 +29,18 @@ const Emulator = struct {
     cpu: cpu_mod.Cpu,
     ui: ?ui_mod.Ui = null,
     options: RuntimeOptions,
+    io: std.Io,
 
-    fn init(allocator: std.mem.Allocator, elf_path: []const u8, enable_ui: bool, options: RuntimeOptions) !Emulator {
-        var bus = bus_mod.Bus{};
-        const elf_bytes = try std.fs.cwd().readFileAlloc(allocator, elf_path, 1 << 20);
+    fn init(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, elf_path: []const u8, enable_ui: bool, options: RuntimeOptions) !Emulator {
+        var bus = bus_mod.Bus{ .io = io };
+        const elf_bytes = try std.Io.Dir.cwd().readFileAlloc(io, elf_path, allocator, .limited(1 << 20));
         defer allocator.free(elf_bytes);
 
         const image = try elf.load(elf_bytes, &bus.flash, &bus.ram);
         const cpu = cpu_mod.Cpu.init(image.entry, bus_mod.ram_base + bus_mod.ram_size);
         var ui: ?ui_mod.Ui = null;
         if (enable_ui) {
-            ui = try ui_mod.Ui.init(allocator);
+            ui = try ui_mod.Ui.init(allocator, io, options.graphics_protocol, environ);
         }
         return .{
             .allocator = allocator,
@@ -41,6 +48,7 @@ const Emulator = struct {
             .cpu = cpu,
             .ui = ui,
             .options = options,
+            .io = io,
         };
     }
 
@@ -50,7 +58,8 @@ const Emulator = struct {
 
     fn run(self: *Emulator) !void {
         const frame_interval_ns = self.options.target_frame_ns;
-        var next_present_ns = std.time.nanoTimestamp();
+        const clock_start_ns = nowNs(self.io);
+        var next_present_ns = clock_start_ns;
         var stats_last_ns = next_present_ns;
         var stats_last_snapshot = self.statsSnapshot();
 
@@ -73,7 +82,9 @@ const Emulator = struct {
                 };
             }
 
-            const now_ns = std.time.nanoTimestamp();
+            try self.syncRealTime(clock_start_ns);
+
+            const now_ns = nowNs(self.io);
             if (self.ui != null and now_ns >= next_present_ns) {
                 if (self.ui) |*ui| try ui.present(&self.bus);
                 next_present_ns = now_ns + frame_interval_ns;
@@ -87,15 +98,26 @@ const Emulator = struct {
                 const frame_delta = snapshot.ui_frames_presented - stats_last_snapshot.ui_frames_presented;
                 const upload_delta = snapshot.ui_texture_uploads - stats_last_snapshot.ui_texture_uploads;
                 const acquire_delta = snapshot.ui_acquire_timeout_count - stats_last_snapshot.ui_acquire_timeout_count;
-                std.log.info("stats fps={d:.1} step/s={d:.0} uploads/s={d:.1} acquire_timeout/s={d:.1}", .{
+                const bytes_delta = snapshot.ui_bytes_written - stats_last_snapshot.ui_bytes_written;
+                std.log.info("stats fps={d:.1} step/s={d:.0} uploads/s={d:.1} output={d:.1} KiB/s acquire_timeout/s={d:.1}", .{
                     @as(f64, @floatFromInt(frame_delta)) / elapsed_s,
                     @as(f64, @floatFromInt(cpu_delta)) / elapsed_s,
                     @as(f64, @floatFromInt(upload_delta)) / elapsed_s,
+                    @as(f64, @floatFromInt(bytes_delta)) / elapsed_s / 1024.0,
                     @as(f64, @floatFromInt(acquire_delta)) / elapsed_s,
                 });
                 stats_last_ns = now_ns;
                 stats_last_snapshot = snapshot;
             }
+        }
+    }
+
+    fn syncRealTime(self: *const Emulator, clock_start_ns: i96) !void {
+        const emulated_ns: i96 = @intCast((@as(u128, self.cpu.cycle_count) * std.time.ns_per_s) / core_clock_hz);
+        const target_ns = clock_start_ns + emulated_ns;
+        const now_ns = nowNs(self.io);
+        if (target_ns > now_ns) {
+            try std.Io.sleep(self.io, .{ .nanoseconds = target_ns - now_ns }, .awake);
         }
     }
 
@@ -147,20 +169,21 @@ const Emulator = struct {
             snapshot.ui_frames_presented = ui_stats.frames_presented;
             snapshot.ui_texture_uploads = ui_stats.texture_uploads;
             snapshot.ui_acquire_timeout_count = ui_stats.acquire_timeout_count;
+            snapshot.ui_bytes_written = ui_stats.bytes_written;
         }
         return snapshot;
     }
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+fn nowNs(io: std.Io) i96 {
+    return std.Io.Clock.awake.now(io).nanoseconds;
+}
 
-    var args = try std.process.argsWithAllocator(allocator);
-    defer args.deinit();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.arena.allocator();
 
-    _ = args.next();
+    const args = try init.minimal.args.toSlice(allocator);
+    var arg_index: usize = 1;
 
     var elf_path: ?[]const u8 = null;
     var headless = false;
@@ -168,43 +191,68 @@ pub fn main() !void {
     var dump_oled = false;
     var options = RuntimeOptions{};
 
-    while (args.next()) |arg| {
+    while (arg_index < args.len) {
+        const arg = args[arg_index];
+        arg_index += 1;
         if (std.mem.eql(u8, arg, "--elf")) {
-            elf_path = args.next() orelse return error.InvalidUsage;
+            if (arg_index == args.len) return error.InvalidUsage;
+            elf_path = args[arg_index];
+            arg_index += 1;
         } else if (std.mem.eql(u8, arg, "--headless")) {
             headless = true;
         } else if (std.mem.eql(u8, arg, "--steps")) {
-            const raw = args.next() orelse return error.InvalidUsage;
+            if (arg_index == args.len) return error.InvalidUsage;
+            const raw = args[arg_index];
+            arg_index += 1;
             headless_steps = try std.fmt.parseInt(usize, raw, 10);
         } else if (std.mem.eql(u8, arg, "--dump-oled")) {
             dump_oled = true;
         } else if (std.mem.eql(u8, arg, "--stats")) {
             options.enable_stats = true;
         } else if (std.mem.eql(u8, arg, "--cpu-slice")) {
-            const raw = args.next() orelse return error.InvalidUsage;
+            if (arg_index == args.len) return error.InvalidUsage;
+            const raw = args[arg_index];
+            arg_index += 1;
             options.cpu_slice_steps = try std.fmt.parseInt(usize, raw, 10);
             if (options.cpu_slice_steps == 0) return error.InvalidUsage;
         } else if (std.mem.eql(u8, arg, "--target-fps")) {
-            const raw = args.next() orelse return error.InvalidUsage;
+            if (arg_index == args.len) return error.InvalidUsage;
+            const raw = args[arg_index];
+            arg_index += 1;
             const fps = try std.fmt.parseInt(u32, raw, 10);
             if (fps == 0) return error.InvalidUsage;
             options.target_frame_ns = std.time.ns_per_s / fps;
+        } else if (std.mem.eql(u8, arg, "--graphics")) {
+            if (arg_index == args.len) return error.InvalidUsage;
+            const value = args[arg_index];
+            arg_index += 1;
+            options.graphics_protocol = if (std.mem.eql(u8, value, "auto"))
+                .auto
+            else if (std.mem.eql(u8, value, "kitty"))
+                .kitty
+            else if (std.mem.eql(u8, value, "sixel"))
+                .sixel
+            else
+                return error.InvalidUsage;
         } else {
             return error.InvalidUsage;
         }
     }
 
     const path = elf_path orelse {
-        std.log.err("usage: ch32fun-desktop-emulator --elf /path/to/mopping_z.elf [--stats] [--cpu-slice N] [--target-fps N]", .{});
+        std.log.err("usage: ch32fun-desktop-emulator --elf firmware.elf [--graphics auto|kitty|sixel] [--target-fps N]", .{});
         return error.InvalidUsage;
     };
 
-    var emulator = try Emulator.init(allocator, path, !headless, options);
+    var emulator = try Emulator.init(allocator, init.io, init.environ_map, path, !headless, options);
     defer emulator.deinit();
     if (headless) {
         try emulator.runHeadless(headless_steps);
         if (dump_oled) {
-            try emulator.dumpOledAscii(std.fs.File.stdout().deprecatedWriter());
+            var stdout_buffer: [4096]u8 = undefined;
+            var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+            try emulator.dumpOledAscii(&stdout_writer.interface);
+            try stdout_writer.interface.flush();
         }
     } else {
         try emulator.run();

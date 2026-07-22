@@ -11,6 +11,7 @@ pub const Cpu = struct {
     regs: [32]u32 = [_]u32{0} ** 32,
     pc: u32 = 0,
     instruction_count: u64 = 0,
+    cycle_count: u64 = 0,
 
     pub fn init(entry: u32, stack_top: u32) Cpu {
         var cpu = Cpu{ .pc = entry };
@@ -20,6 +21,8 @@ pub const Cpu = struct {
 
     pub fn step(self: *Cpu, bus: *Bus) !void {
         const half = try bus.fetch16(self.pc);
+        const cycles: u64 = estimateCycles(half);
+        bus.cpu_cycles = self.cycle_count;
         if ((half & 0b11) != 0b11) {
             try self.execCompressed(bus, half);
         } else {
@@ -28,6 +31,8 @@ pub const Cpu = struct {
         }
         self.regs[0] = 0;
         self.instruction_count += 1;
+        self.cycle_count += cycles;
+        bus.cpu_cycles = self.cycle_count;
     }
 
     fn exec32(self: *Cpu, bus: *Bus, inst: u32) !void {
@@ -290,6 +295,27 @@ pub const Cpu = struct {
         self.regs[rd] = value;
     }
 };
+
+fn estimateCycles(half: u16) u64 {
+    if ((half & 0b11) != 0b11) {
+        const quadrant = half & 0b11;
+        const funct3 = (half >> 13) & 0x7;
+        return switch (quadrant) {
+            0b00 => if (funct3 == 0b010 or funct3 == 0b110) 2 else 1,
+            0b01 => if (funct3 == 0b001 or funct3 == 0b101 or funct3 == 0b110 or funct3 == 0b111) 2 else 1,
+            0b10 => if (funct3 == 0b010 or funct3 == 0b100 or funct3 == 0b110) 2 else 1,
+            else => 1,
+        };
+    }
+    // Loads/stores and control transfers require an additional pipeline cycle
+    // on the small QingKe core. The remaining RV32E instructions are modeled
+    // as single-cycle operations.
+    const opcode = half & 0x7f;
+    return switch (opcode) {
+        0x03, 0x23, 0x63, 0x67, 0x6f => 2,
+        else => 1,
+    };
+}
 
 fn immI(inst: u32) i32 {
     return @as(i32, @bitCast(inst)) >> 20;

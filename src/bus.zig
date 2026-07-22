@@ -18,6 +18,9 @@ const systick_ctlr_ste: u32 = 1 << 0;
 const systick_ctlr_stclk: u32 = 1 << 2;
 const i2c_star1_txe: u16 = 0x0080;
 const i2c_star2_busy: u16 = 0x0002;
+// ch32fun_zig configures I2C1 for 1 MHz. One byte including ACK occupies
+// nine bus clocks, or 432 CPU clocks at the CH32V003's 48 MHz core clock.
+const i2c_byte_cycles: u64 = 9 * 48;
 
 const OledState = struct {
     vram: [128 * 64 / 8]u8 = [_]u8{0} ** (128 * 64 / 8),
@@ -123,9 +126,9 @@ const SysTickRegs = struct {
     cmp: u32 = 0,
     start_ns: u64 = 0,
 
-    fn now(self: *const SysTickRegs) u32 {
+    fn now(self: *const SysTickRegs, io: ?std.Io) u32 {
         if ((self.ctlr & systick_ctlr_ste) == 0 or (self.ctlr & systick_ctlr_stclk) == 0) return self.cnt;
-        const elapsed_ns = std.time.nanoTimestamp() - @as(i128, @intCast(self.start_ns));
+        const elapsed_ns = nowNs(io) - @as(i96, @intCast(self.start_ns));
         const ticks = (@as(u128, @intCast(elapsed_ns)) * 48_000_000) / std.time.ns_per_s;
         return self.cnt +% @as(u32, @truncate(ticks));
     }
@@ -150,9 +153,13 @@ const I2cRegs = struct {
     current_addr: u8 = 0,
     packet_len: usize = 0,
     packet: [64]u8 = [_]u8{0} ** 64,
+    ready_cycle: u64 = 0,
+    ready_star1: u16 = 0,
 };
 
 pub const Bus = struct {
+    io: ?std.Io = null,
+    cpu_cycles: u64 = 0,
     flash: [flash_size]u8 = [_]u8{0} ** flash_size,
     ram: [ram_size]u8 = [_]u8{0} ** ram_size,
     rcc: RccRegs = .{},
@@ -258,13 +265,14 @@ pub const Bus = struct {
             return switch (offset) {
                 0 => castRead(T, self.systick.ctlr),
                 4 => castRead(T, self.systick.sr),
-                8 => castRead(T, self.systick.now()),
+                8 => castRead(T, self.systick.now(self.io)),
                 16 => castRead(T, self.systick.cmp),
                 else => castRead(T, 0),
             };
         }
 
         if (address >= i2c1_base and address < i2c1_base + 32) {
+            self.updateI2cStatus();
             const offset = address - i2c1_base;
             return switch (offset) {
                 0 => castRead(T, self.i2c.ctlr1),
@@ -326,7 +334,7 @@ pub const Bus = struct {
                 4 => self.systick.sr = v,
                 8 => {
                     self.systick.cnt = v;
-                    self.systick.start_ns = @as(u64, @intCast(std.time.nanoTimestamp()));
+                    self.systick.start_ns = @as(u64, @intCast(nowNs(self.io)));
                 },
                 16 => self.systick.cmp = v,
                 else => {},
@@ -349,6 +357,7 @@ pub const Bus = struct {
                         self.i2c.phase = .idle;
                         self.i2c.packet_len = 0;
                         self.i2c.star1 = i2c_star1_txe;
+                        self.i2c.ready_star1 = 0;
                         self.i2c.star2 = 0;
                         self.i2c.ctlr1 &= ~@as(u16, 0x0300);
                     } else if ((v & 0x0100) != 0) {
@@ -368,7 +377,9 @@ pub const Bus = struct {
                             self.i2c.current_addr = @as(u8, @truncate(v >> 1));
                             self.i2c.phase = .addressed;
                             self.i2c.ctlr1 &= ~@as(u16, 0x0100);
-                            self.i2c.star1 = 0x0082;
+                            self.i2c.star1 = 0;
+                            self.i2c.ready_star1 = 0x0082;
+                            self.i2c.ready_cycle = self.cpu_cycles + i2c_byte_cycles;
                             self.i2c.star2 = 0x0007;
                         },
                         .addressed => {
@@ -377,7 +388,9 @@ pub const Bus = struct {
                                 self.i2c.packet[self.i2c.packet_len] = @as(u8, @truncate(v));
                                 self.i2c.packet_len += 1;
                             }
-                            self.i2c.star1 = 0x0084;
+                            self.i2c.star1 = 0;
+                            self.i2c.ready_star1 = 0x0084;
+                            self.i2c.ready_cycle = self.cpu_cycles + i2c_byte_cycles;
                             self.i2c.star2 = 0x0007;
                         },
                         .idle => {},
@@ -387,6 +400,13 @@ pub const Bus = struct {
                 else => {},
             }
             return;
+        }
+    }
+
+    fn updateI2cStatus(self: *Bus) void {
+        if (self.i2c.ready_star1 != 0 and self.cpu_cycles >= self.i2c.ready_cycle) {
+            self.i2c.star1 = self.i2c.ready_star1;
+            self.i2c.ready_star1 = 0;
         }
     }
 
@@ -429,6 +449,10 @@ pub const Bus = struct {
         self.i2c.star2 = 0x0007;
     }
 };
+
+fn nowNs(io: ?std.Io) i96 {
+    return if (io) |value| std.Io.Clock.awake.now(value).nanoseconds else 0;
+}
 
 fn castRead(comptime T: type, value: anytype) T {
     return @as(T, @intCast(value));
