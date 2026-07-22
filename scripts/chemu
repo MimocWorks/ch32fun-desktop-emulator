@@ -1,0 +1,89 @@
+#!/bin/sh
+set -eu
+
+usage() {
+    cat <<'EOF'
+Usage: chemu [--no-build] [--firmware PATH] [emulator options]
+
+Builds the ch32fun_zig project in the current directory, finds its RISC-V
+ELF in zig-out/bin, and starts the terminal emulator.
+
+Launcher options:
+  --no-build       Use an existing artifact without running `zig build`
+  --firmware PATH  Use a specific ELF artifact
+  -h, --help       Show this help
+
+All remaining options are passed to the emulator, for example:
+  chemu --graphics kitty --target-fps 60
+EOF
+}
+
+build=true
+firmware=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --no-build)
+            build=false
+            shift
+            ;;
+        --firmware)
+            [ "$#" -ge 2 ] || { echo "chemu: --firmware requires a path" >&2; exit 2; }
+            firmware=$2
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+if [ -z "$firmware" ]; then
+    [ -f build.zig ] || {
+        echo "chemu: run this command in a ch32fun_zig project directory (build.zig not found)" >&2
+        exit 1
+    }
+
+    if [ "$build" = true ]; then
+        zig build
+    fi
+
+    count=0
+    found=
+    for candidate in zig-out/bin/*; do
+        [ -f "$candidate" ] || continue
+        description=$(file -b "$candidate" 2>/dev/null || true)
+        case "$description" in
+            *ELF*RISC-V*)
+                found=$candidate
+                count=$((count + 1))
+                ;;
+        esac
+    done
+
+    if [ "$count" -eq 0 ]; then
+        echo "chemu: no RISC-V ELF found in zig-out/bin" >&2
+        echo "chemu: specify one with --firmware PATH" >&2
+        exit 1
+    fi
+    if [ "$count" -ne 1 ]; then
+        echo "chemu: multiple RISC-V ELF files found; select one with --firmware PATH" >&2
+        exit 1
+    fi
+    firmware=$found
+fi
+
+[ -f "$firmware" ] || { echo "chemu: firmware not found: $firmware" >&2; exit 1; }
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+core=${CHEMU_CORE:-"$script_dir/chemu-core"}
+[ -x "$core" ] || {
+    echo "chemu: emulator executable not found: $core" >&2
+    echo "chemu: reinstall it with scripts/install.sh" >&2
+    exit 1
+}
+
+exec "$core" --elf "$firmware" --graphics kitty --target-fps 60 "$@"
