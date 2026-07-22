@@ -2,7 +2,7 @@
 
 [日本語版 README](docs/README.ja.md)
 
-Desktop emulator for a CH32fun-based firmware ELF. The project loads a firmware image, emulates the CPU and peripheral bus, and renders the SSD1306-style OLED output in a desktop window using SDL3 and Vulkan.
+Terminal emulator for a CH32fun-based firmware ELF. It renders the SSD1306-style OLED at its full 128x64 resolution using the Kitty graphics protocol or Sixel.
 
 ## Demo
 
@@ -12,17 +12,17 @@ Desktop emulator for a CH32fun-based firmware ELF. The project loads a firmware 
 
 - Loads a firmware `.elf` image at runtime
 - Emulates the CPU, flash, RAM, I2C traffic, button input, and OLED VRAM
-- Displays the OLED framebuffer in a resizable desktop window
+- Synchronizes the emulated QingKe CPU to 48 MHz and I2C1 to its configured 1 MHz bus rate
+- Displays the full-resolution OLED framebuffer using Kitty or Sixel terminal graphics
+- Uses crisp nearest-neighbor scaling, white pixels, and top/left display margins
+- Compresses Kitty frames with zlib and sends only changed VRAM to reduce terminal load
 - Supports headless execution for quick inspection and debugging
-- Includes a minimal SDL probe target for environment troubleshooting
+- Uses only the Zig standard library
 
 ## Requirements
 
-- Zig
-- SDL3 development libraries
-- Vulkan loader / development libraries
-- `glslc` for shader compilation
-- X11 environment by default when using `zig build run`
+- Zig 0.16
+- A terminal with Kitty graphics or Sixel support
 
 ## Build
 
@@ -33,7 +33,33 @@ zig build
 This builds:
 
 - `zig-out/bin/ch32fun-desktop-emulator`
-- `zig-out/bin/sdl-probe`
+
+## Install the `chemu` command
+
+```sh
+scripts/install.sh
+```
+
+This installs `chemu` and a ReleaseFast-optimized emulator executable to `~/.local/bin`. Set
+`PREFIX` or `BINDIR` to use another location.
+
+From a `ch32fun_zig` project directory, build and run its firmware with:
+
+```sh
+chemu
+```
+
+The command runs `zig build`, detects the RISC-V ELF in `zig-out/bin`, and
+starts the emulator with Kitty graphics at 60 FPS by default. Useful launcher options include:
+
+- `--no-build`: run an existing artifact without rebuilding
+- `--firmware PATH`: select an ELF explicitly when the project produces more than one
+
+Emulator options can follow the launcher options:
+
+```sh
+chemu --graphics sixel --target-fps 30
+```
 
 ## Usage
 
@@ -45,10 +71,11 @@ zig build run -- --elf /path/to/firmware.elf
 
 Useful options:
 
-- `--stats`: print runtime statistics once per second
+- `--stats`: print actual FPS, instruction rate, terminal output rate, and other statistics once per second
 - `--cpu-slice N`: number of CPU steps per execution slice
 - `--target-fps N`: UI presentation target
-- `--headless`: run without creating the SDL/Vulkan UI
+- `--graphics auto|kitty|sixel`: select the terminal graphics protocol
+- `--headless`: run without terminal graphics
 - `--steps N`: number of instructions to execute in headless mode
 - `--dump-oled`: print the OLED framebuffer as ASCII after headless execution
 
@@ -58,6 +85,9 @@ Example:
 zig build run -- --elf /path/to/firmware.elf --stats
 ```
 
+The defaults are tuned for efficiency. Lowering `--cpu-slice` can reduce input
+latency, but increases CPU usage by performing more sleeps and clock queries.
+
 Headless example:
 
 ```sh
@@ -66,16 +96,16 @@ zig build run -- --elf /path/to/firmware.elf --headless --steps 200000 --dump-ol
 
 ## Controls
 
-- `Space`: press the emulated button
-- `Esc`: quit
-- Window close button: quit
+- `Space`: press/release the emulated button (true key-up on Kitty keyboard capable terminals; a 150 ms pulse otherwise)
+- `d`: hold the tact switch down
+- `u`: release the tact switch
+- `Esc`, `q`, or `Ctrl-C`: quit
 
-## SDL Environment Probe
-
-If the main window does not appear, test SDL separately:
+Kitty is selected automatically when `KITTY_WINDOW_ID` or a Kitty `TERM` is detected. Other terminals default to Sixel. Override detection when needed:
 
 ```sh
-zig build probe
+zig build run -- --elf firmware.elf --graphics kitty --target-fps 60
+zig build run -- --elf firmware.elf --graphics sixel --target-fps 30
 ```
 
 ## Helper Script
@@ -90,12 +120,10 @@ The script uses these environment variables when needed:
 
 - `MOPECK_DIR`
 - `EMULATOR_DIR`
-- `SDL_VIDEODRIVER`
 
 ## Project Layout
 
 - `src/`: emulator implementation
-- `shaders/`: Vulkan shaders for OLED rendering
 - `tools/`: helper scripts
 
 ## License
