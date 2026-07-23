@@ -10,6 +10,7 @@ const kitty_rgb_len = kitty_width * kitty_height * 3;
 // DEFLATE's worst-case overhead is well below one percent for this input.
 const kitty_compressed_capacity = kitty_rgb_len + kitty_rgb_len / 100 + 64;
 const kitty_encoded_len = std.base64.standard.Encoder.calcSize(kitty_compressed_capacity);
+const legacy_button_pulse_ms = 600;
 
 pub const Protocol = enum {
     auto,
@@ -129,10 +130,11 @@ pub const Ui = struct {
             switch (input[index]) {
                 3, 27, 'q' => return false,
                 // Legacy terminals do not report key-up. Keep a normal Space
-                // press active long enough to survive a complete firmware loop.
+                // press active long enough for firmware to detect a 500 ms
+                // long press despite input polling latency.
                 ' ' => {
                     bus.setButtonPressed(true);
-                    self.button_release_deadline_ns = nowNs(self.io) + 150 * std.time.ns_per_ms;
+                    self.button_release_deadline_ns = nowNs(self.io) + legacy_button_pulse_ms * std.time.ns_per_ms;
                 },
                 // Portable explicit switch controls for terminals without the
                 // Kitty keyboard protocol: d=contact down, u=contact up.

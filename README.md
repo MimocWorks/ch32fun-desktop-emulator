@@ -96,7 +96,7 @@ zig build run -- --elf /path/to/firmware.elf --headless --steps 200000 --dump-ol
 
 ## Controls
 
-- `Space`: press/release the emulated button (true key-up on Kitty keyboard capable terminals; a 150 ms pulse otherwise)
+- `Space`: press/release the emulated button (true key-up on Kitty keyboard capable terminals; a 600 ms pulse otherwise, sufficient for a 500 ms long-press threshold)
 - `d`: hold the tact switch down
 - `u`: release the tact switch
 - `Esc`, `q`, or `Ctrl-C`: quit
