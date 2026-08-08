@@ -93,6 +93,7 @@ zig build run -- --elf /path/to/firmware.elf --headless --steps 200000 --dump-ol
 
 ## 操作
 
+- `←` / `→`: ロータリーエンコーダーを反時計回り／時計回りに1クリック回転（A相: PA2、B相: PD5）
 - `Space`: タクトスイッチを押下・解放（Kitty keyboard対応端末では実際のkey-up、それ以外では150 msの短押し）
 - `d`: タクトスイッチを押した状態にする
 - `u`: タクトスイッチを解放する
