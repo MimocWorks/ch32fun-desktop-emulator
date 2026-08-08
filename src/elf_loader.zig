@@ -64,8 +64,10 @@ pub fn load(bytes: []const u8, flash: []u8, ram: []u8) !Image {
 fn loadSegment(bytes: []const u8, ph: ProgramHeader, flash: []u8, ram: []u8) !void {
     const source = bytes[ph.p_offset .. ph.p_offset + ph.p_filesz];
 
-    if (ph.p_paddr >= 0x0800_0000 and ph.p_paddr + ph.p_memsz <= 0x0800_0000 + flash.len) {
-        const dst = ph.p_paddr - 0x0800_0000;
+    // CH32V003 exposes flash both at its native 0x0800_0000 address and at
+    // address zero.  Current ch32fun linker scripts use the zero-address
+    // alias, including for the load address of initialized RAM data.
+    if (flashOffset(ph.p_paddr, ph.p_memsz, flash.len)) |dst| {
         @memcpy(flash[dst .. dst + ph.p_filesz], source);
         @memset(flash[dst + ph.p_filesz .. dst + ph.p_memsz], 0);
         return;
@@ -79,4 +81,16 @@ fn loadSegment(bytes: []const u8, ph: ProgramHeader, flash: []u8, ram: []u8) !vo
     }
 
     return Error.SegmentOutOfRange;
+}
+
+fn flashOffset(address: u32, size: u32, flash_len: usize) ?usize {
+    const offset = if (address < 0x0800_0000) address else address - 0x0800_0000;
+    if (offset > flash_len or size > flash_len - offset) return null;
+    return offset;
+}
+
+test "flash accepts native and zero-address alias segments" {
+    try std.testing.expectEqual(@as(?usize, 0x1234), flashOffset(0x0000_1234, 4, 16 * 1024));
+    try std.testing.expectEqual(@as(?usize, 0x1234), flashOffset(0x0800_1234, 4, 16 * 1024));
+    try std.testing.expectEqual(@as(?usize, null), flashOffset(0x0000_4000, 1, 16 * 1024));
 }

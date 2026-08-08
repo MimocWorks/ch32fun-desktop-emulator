@@ -12,6 +12,9 @@ pub const Cpu = struct {
     pc: u32 = 0,
     instruction_count: u64 = 0,
     cycle_count: u64 = 0,
+    mstatus: u32 = 0,
+    mtvec: u32 = 0,
+    mepc: u32 = 0,
 
     pub fn init(entry: u32, stack_top: u32) Cpu {
         var cpu = Cpu{ .pc = entry };
@@ -20,6 +23,7 @@ pub const Cpu = struct {
     }
 
     pub fn step(self: *Cpu, bus: *Bus) !void {
+        if (bus.extiInterruptPending() and (self.mstatus & (1 << 3)) != 0) self.enterInterrupt();
         // A single 32-bit fetch covers both standard and compressed
         // instructions and avoids reading the first halfword twice.
         const inst = try bus.fetchInstruction(self.pc);
@@ -145,9 +149,25 @@ pub const Cpu = struct {
             },
             0x0f => self.pc = pc_next,
             0x73 => {
-                // Minimal CSR subset: treat as NOP unless it is ebreak/ecall.
                 if (inst == 0x0010_0073 or inst == 0x0000_0073) return Error.UnsupportedOpcode;
-                self.pc = pc_next;
+                if (inst == 0x3020_0073) {
+                    self.mstatus = (self.mstatus & ~@as(u32, 1 << 3)) | ((self.mstatus >> 4) & (1 << 3));
+                    self.mstatus |= 1 << 7;
+                    self.pc = self.mepc;
+                } else {
+                    const csr: u12 = @truncate(inst >> 20);
+                    const old = self.readCsr(csr);
+                    const source = if (funct3 >= 5) @as(u32, rs1) else self.regs[rs1];
+                    const value = switch (funct3) {
+                        1, 5 => source,
+                        2, 6 => old | source,
+                        3, 7 => old & ~source,
+                        else => old,
+                    };
+                    if (funct3 != 0 and !((funct3 == 2 or funct3 == 3 or funct3 == 6 or funct3 == 7) and source == 0)) self.writeCsr(csr, value);
+                    self.writeReg(rd, old);
+                    self.pc = pc_next;
+                }
             },
             else => return Error.UnsupportedOpcode,
         }
@@ -299,6 +319,30 @@ pub const Cpu = struct {
     fn writeReg(self: *Cpu, rd: u5, value: u32) void {
         if (rd == 0) return;
         self.regs[rd] = value;
+    }
+
+    fn readCsr(self: *const Cpu, csr: u12) u32 {
+        return switch (csr) {
+            0x300 => self.mstatus,
+            0x305 => self.mtvec,
+            0x341 => self.mepc,
+            else => 0,
+        };
+    }
+
+    fn writeCsr(self: *Cpu, csr: u12, value: u32) void {
+        switch (csr) {
+            0x300 => self.mstatus = value,
+            0x305 => self.mtvec = value,
+            0x341 => self.mepc = value,
+            else => {},
+        }
+    }
+
+    fn enterInterrupt(self: *Cpu) void {
+        self.mepc = self.pc;
+        self.mstatus = (self.mstatus & ~@as(u32, (1 << 3) | (1 << 7))) | ((self.mstatus & (1 << 3)) << 4);
+        self.pc = self.mtvec & ~@as(u32, 0x3);
     }
 };
 

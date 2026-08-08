@@ -3,7 +3,9 @@ const bus_mod = @import("bus.zig");
 
 const oled_width = 128;
 const oled_height = 64;
-const kitty_scale = 4;
+// The terminal scales the image to 64x16 cells, so 2x source pixels retain
+// sharp OLED pixels while avoiding the cost of compressing a 512x256 frame.
+const kitty_scale = 2;
 const kitty_width = oled_width * kitty_scale;
 const kitty_height = oled_height * kitty_scale;
 const kitty_rgb_len = kitty_width * kitty_height * 3;
@@ -115,15 +117,35 @@ pub const Ui = struct {
     fn processInput(self: *Ui, bus: *bus_mod.Bus, input: []const u8) bool {
         var index: usize = 0;
         while (index < input.len) {
+            if (input[index] == 0x1b and index + 2 < input.len and input[index + 1] == 'O' and
+                (input[index + 2] == 'C' or input[index + 2] == 'D'))
+            {
+                bus.queueRotaryStep(if (input[index + 2] == 'C') 1 else -1);
+                index += 3;
+                continue;
+            }
             if (input[index] == 0x1b and index + 2 < input.len and input[index + 1] == '[') {
-                const end = std.mem.indexOfScalarPos(u8, input, index + 2, 'u') orelse {
+                var final = index + 2;
+                while (final < input.len and (input[final] < 0x40 or input[final] > 0x7e)) : (final += 1) {}
+                if (final == input.len) return true;
+
+                const final_byte = input[final];
+                const parameters = input[index + 2 .. final];
+                if (final_byte == 'C' or final_byte == 'D') {
+                    if (keyEventType(parameters) != 3) {
+                        bus.queueRotaryStep(if (final_byte == 'C') 1 else -1);
+                    }
+                    index = final + 1;
+                    continue;
+                }
+                if (final_byte != 'u') {
                     // A lone Escape remains the quit key.
                     if (index + 1 == input.len) return false;
-                    index += 1;
+                    index = final + 1;
                     continue;
-                };
-                if (!self.processKittyKey(bus, input[index + 2 .. end])) return false;
-                index = end + 1;
+                }
+                if (!self.processKittyKey(bus, parameters)) return false;
+                index = final + 1;
                 continue;
             }
 
@@ -156,11 +178,7 @@ pub const Ui = struct {
     fn processKittyKey(self: *Ui, bus: *bus_mod.Bus, parameters: []const u8) bool {
         const key_end = std.mem.indexOfAny(u8, parameters, ";:") orelse parameters.len;
         const codepoint = std.fmt.parseInt(u21, parameters[0..key_end], 10) catch return true;
-        var event: u8 = 1;
-        if (std.mem.indexOfScalar(u8, parameters, ':')) |colon| {
-            const event_end = std.mem.indexOfScalarPos(u8, parameters, colon + 1, ';') orelse parameters.len;
-            event = std.fmt.parseInt(u8, parameters[colon + 1 .. event_end], 10) catch 1;
-        }
+        const event = keyEventType(parameters);
 
         if (codepoint == 27 or codepoint == 'q' or (codepoint == 'c' and std.mem.indexOf(u8, parameters, ";5") != null)) return false;
         if (codepoint == ' ') {
@@ -254,6 +272,12 @@ pub const Ui = struct {
     }
 };
 
+fn keyEventType(parameters: []const u8) u8 {
+    const colon = std.mem.indexOfScalar(u8, parameters, ':') orelse return 1;
+    const event_end = std.mem.indexOfScalarPos(u8, parameters, colon + 1, ';') orelse parameters.len;
+    return std.fmt.parseInt(u8, parameters[colon + 1 .. event_end], 10) catch 1;
+}
+
 fn nowNs(io: std.Io) i96 {
     return std.Io.Clock.awake.now(io).nanoseconds;
 }
@@ -317,4 +341,32 @@ fn writeAll(io: std.Io, bytes: []const u8) !void {
 test "sixel encoder emits a complete frame" {
     const bus = bus_mod.Bus{};
     _ = bus;
+}
+
+test "right arrow emits a complete clockwise quadrature cycle" {
+    var ui: Ui = undefined;
+    var bus = bus_mod.Bus{};
+
+    try std.testing.expect(ui.processInput(&bus, "\x1b[C"));
+    const expected = [_]u32{
+        1 << 5,
+        0,
+        1 << 2,
+        (1 << 2) | (1 << 5),
+    };
+    for (expected) |state| {
+        const a = (try bus.read32(bus_mod.gpioa_base + 8)) & (1 << 2);
+        const b = (try bus.read32(bus_mod.gpiod_base + 8)) & (1 << 5);
+        try std.testing.expectEqual(state, a | b);
+    }
+}
+
+test "Kitty enhanced arrow press is accepted and release is ignored" {
+    var ui: Ui = undefined;
+    var bus = bus_mod.Bus{};
+
+    try std.testing.expect(ui.processInput(&bus, "\x1b[1;1:1C"));
+    try std.testing.expectEqual(@as(u3, 1), bus.rotary_phase);
+    try std.testing.expect(ui.processInput(&bus, "\x1b[1;1:3D"));
+    try std.testing.expectEqual(@as(i16, 0), bus.rotary_pending);
 }
