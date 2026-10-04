@@ -8,7 +8,7 @@ pub const Error = error{
 };
 
 pub const Cpu = struct {
-    regs: [32]u32 = [_]u32{0} ** 32,
+    regs: [32]u32 = @splat(0),
     pc: u32 = 0,
     instruction_count: u64 = 0,
     cycle_count: u64 = 0,

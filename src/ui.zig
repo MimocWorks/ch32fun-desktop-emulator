@@ -39,7 +39,7 @@ pub const Ui = struct {
     button_release_deadline_ns: ?i96 = null,
     frames_presented: u64 = 0,
     bytes_written: u64 = 0,
-    last_vram: [128 * 64 / 8]u8 = [_]u8{0} ** (128 * 64 / 8),
+    last_vram: [128 * 64 / 8]u8 = @splat(0),
     has_presented_frame: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, protocol: Protocol, environ: *const std.process.Environ.Map) !Ui {

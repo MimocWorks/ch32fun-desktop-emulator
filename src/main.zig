@@ -4,6 +4,13 @@ const cpu_mod = @import("cpu.zig");
 const bus_mod = @import("bus.zig");
 const ui_mod = @import("ui.zig");
 
+test {
+    std.testing.refAllDecls(elf);
+    std.testing.refAllDecls(cpu_mod);
+    std.testing.refAllDecls(bus_mod);
+    std.testing.refAllDecls(ui_mod);
+}
+
 const core_clock_hz: u64 = 48_000_000;
 // Terminal input does not need to be polled for every CPU execution slice.
 // 120 Hz keeps added latency below one display frame while avoiding hundreds

@@ -26,7 +26,7 @@ const i2c_star2_busy: u16 = 0x0002;
 const i2c_byte_cycles: u64 = 9 * 48;
 
 const OledState = struct {
-    vram: [128 * 64 / 8]u8 = [_]u8{0} ** (128 * 64 / 8),
+    vram: [128 * 64 / 8]u8 = @splat(0),
     column_start: u8 = 0,
     column_end: u8 = 127,
     page_start: u8 = 0,
@@ -170,7 +170,7 @@ const I2cRegs = struct {
     phase: I2cPhase = .idle,
     current_addr: u8 = 0,
     packet_len: usize = 0,
-    packet: [64]u8 = [_]u8{0} ** 64,
+    packet: [64]u8 = @splat(0),
     ready_cycle: u64 = 0,
     ready_star1: u16 = 0,
 };
@@ -185,8 +185,8 @@ pub const Bus = struct {
     // which a polled condition changes. This avoids interpreting thousands of
     // iterations of a firmware busy-wait without changing device timing.
     stall_until_cycle: ?u64 = null,
-    flash: [flash_size]u8 = [_]u8{0} ** flash_size,
-    ram: [ram_size]u8 = [_]u8{0} ** ram_size,
+    flash: [flash_size]u8 = @splat(0),
+    ram: [ram_size]u8 = @splat(0),
     rcc: RccRegs = .{},
     flash_regs: FlashRegs = .{},
     afio: AfioRegs = .{},

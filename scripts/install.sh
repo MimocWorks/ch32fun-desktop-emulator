@@ -6,7 +6,7 @@ project_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 prefix=${PREFIX:-"$HOME/.local"}
 bindir=${BINDIR:-"$prefix/bin"}
 
-echo "Building chemu with Zig 0.16..."
+echo "Building chemu with Zig 0.17..."
 zig build --build-file "$project_dir/build.zig" -Doptimize=ReleaseFast --prefix "$project_dir/zig-out"
 
 install -d "$bindir"

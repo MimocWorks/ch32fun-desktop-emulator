@@ -21,7 +21,7 @@ Terminal emulator for a CH32fun-based firmware ELF. It renders the SSD1306-style
 
 ## Requirements
 
-- Zig 0.16
+- Zig 0.17
 - A terminal with Kitty graphics or Sixel support
 
 ## Build
@@ -29,6 +29,8 @@ Terminal emulator for a CH32fun-based firmware ELF. It renders the SSD1306-style
 ```sh
 zig build
 ```
+
+Run the emulator tests with `zig build test`.
 
 This builds:
 

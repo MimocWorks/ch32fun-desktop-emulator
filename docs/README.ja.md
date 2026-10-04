@@ -21,7 +21,7 @@ CH32fun ベースのファームウェア ELF を端末上で実行するエミ�
 
 ## 必要環境
 
-- Zig 0.16
+- Zig 0.17
 - Kitty GraphicsまたはSixel対応端末
 
 ## ビルド
@@ -29,6 +29,8 @@ CH32fun ベースのファームウェア ELF を端末上で実行するエミ�
 ```sh
 zig build
 ```
+
+`zig build test` でエミュレータのテストを実行できます。
 
 生成物:
 
