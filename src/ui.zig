@@ -33,6 +33,8 @@ pub const Ui = struct {
     protocol: Protocol,
     transport: Transport = .direct,
     in_tmux: bool = false,
+    image_id: u32 = 1,
+    placeholder_size: ?CellSize = null,
     allocator: std.mem.Allocator,
     io: std.Io,
     original_termios: std.posix.termios,
@@ -88,6 +90,10 @@ pub const Ui = struct {
             if (try probeKitty(io, &startup_input, &startup_input_len, .direct)) selected_transport = .direct;
         }
 
+        var image_id: u32 = undefined;
+        std.Io.random(io, std.mem.asBytes(&image_id));
+        image_id = (image_id & 0xffffff) | 1;
+
         // Older emulator versions accidentally pushed keyboard modes onto the
         // main-screen stack and popped the alternate-screen stack. Clear those
         // leaked entries before switching screens; popping an empty stack is a
@@ -101,6 +107,7 @@ pub const Ui = struct {
         std.log.info("terminal graphics protocol: {s} (Kitty transport: {s})", .{ @tagName(selected), @tagName(selected_transport) });
         return .{
             .protocol = selected,
+            .image_id = image_id,
             .transport = selected_transport,
             .startup_input = startup_input,
             .startup_input_len = startup_input_len,
@@ -120,7 +127,11 @@ pub const Ui = struct {
         // to the shell, then consume key-release reports already in flight.
         writeAll(self.io, "\x1b[<1u") catch {};
         drainTerminalInput(self.io);
-        if (self.protocol == .kitty) self.sendKitty("\x1b_Ga=d,d=I,i=1,q=2\x1b\\") catch {};
+        if (self.protocol == .kitty) {
+            var command: [80]u8 = undefined;
+            const deletion = std.fmt.bufPrint(&command, "\x1b_Ga=d,d=I,i={d},q=2\x1b\\", .{self.image_id}) catch unreachable;
+            self.sendKitty(deletion) catch {};
+        }
         writeAll(self.io, "\x1b[?25h\x1b[?1049l") catch {};
         std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, self.original_termios) catch {};
         self.allocator.free(self.kitty_encoded);
@@ -269,11 +280,21 @@ pub const Ui = struct {
     }
 
     pub fn present(self: *Ui, bus: *const bus_mod.Bus) !void {
-        if (self.has_presented_frame and std.mem.eql(u8, &self.last_vram, &bus.oled.vram)) return;
+        const placeholders = self.protocol == .kitty and self.transport == .tmux;
+        const size = if (placeholders) terminalCellSize() else CellSize{ .cols = 0, .rows = 0 };
+        const layout_changed = placeholders and (self.placeholder_size == null or !std.meta.eql(self.placeholder_size.?, size));
+        if (!layout_changed and self.has_presented_frame and std.mem.eql(u8, &self.last_vram, &bus.oled.vram)) return;
         switch (self.protocol) {
             .kitty => try self.presentKitty(bus),
             .sixel => try presentSixel(self.io, bus),
             .auto => unreachable,
+        }
+        if (layout_changed) {
+            var grid: [12000]u8 = undefined;
+            const output = try placeholderGrid(&grid, self.image_id, size, self.placeholder_size != null);
+            try writeAll(self.io, output);
+            self.bytes_written += output.len;
+            self.placeholder_size = size;
         }
         @memcpy(&self.last_vram, &bus.oled.vram);
         self.has_presented_frame = true;
@@ -313,13 +334,15 @@ pub const Ui = struct {
         const encoded_len = std.base64.standard.Encoder.calcSize(compressed.len);
         _ = std.base64.standard.Encoder.encode(self.kitty_encoded[0..encoded_len], compressed);
 
-        try writeAll(self.io, "\x1b[2;3H");
-        self.bytes_written += 6;
+        if (self.transport != .tmux) {
+            try writeAll(self.io, "\x1b[2;3H");
+            self.bytes_written += 6;
+        }
         var offset: usize = 0;
         while (offset < encoded_len) {
             var command: [4300]u8 = undefined;
             const end = @min(offset + 4096, encoded_len);
-            const apc = try kittyChunk(&command, self.kitty_encoded[offset..end], offset == 0, end < encoded_len);
+            const apc = try kittyChunk(&command, self.kitty_encoded[offset..end], offset == 0, end < encoded_len, self.image_id, self.transport == .tmux);
             try self.sendKitty(apc);
             offset = end;
         }
@@ -330,6 +353,16 @@ pub const Ui = struct {
         const output = try wrapKitty(&buffer, apc, self.transport);
         try writeAll(self.io, output);
         self.bytes_written += output.len;
+    }
+
+    pub fn writeStatus(self: *Ui, message: []const u8) !void {
+        var buffer: [1024]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        try writer.writeAll("\x1b7\x1b[1;1H\x1b[2K");
+        const width = terminalCellSize().cols -| 1;
+        try writer.writeAll(message[0..@min(width, message.len)]);
+        try writer.writeAll("\x1b8");
+        try writeAll(self.io, writer.buffered());
     }
 
     pub fn stats(self: *const Ui) Stats {
@@ -413,10 +446,58 @@ fn detectProtocol(environ: *const std.process.Environ.Map) !Protocol {
     return error.UnknownGraphicsCapability;
 }
 
-fn kittyChunk(buffer: []u8, payload: []const u8, first: bool, more: bool) ![]const u8 {
+const CellSize = struct { cols: u16, rows: u16 };
+
+fn terminalCellSize() CellSize {
+    var size: std.posix.winsize = undefined;
+    const builtin = @import("builtin");
+    const result = if (builtin.os.tag == .linux)
+        std.os.linux.ioctl(std.posix.STDOUT_FILENO, std.os.linux.T.IOCGWINSZ, @intFromPtr(&size))
+    else
+        std.c.ioctl(std.posix.STDOUT_FILENO, std.c.T.IOCGWINSZ, &size);
+    if (result != 0 or size.col == 0 or size.row == 0) return .{ .cols = 80, .rows = 24 };
+    return .{ .cols = size.col, .rows = size.row };
+}
+
+// First 64 entries of Kitty's canonical rowcolumn-diacritics.txt. Explicit
+// row AND column markers survive tmux clipping, horizontal splits and redraws.
+const diacritics = [_]u21{
+    0x0305, 0x030d, 0x030e, 0x0310, 0x0312, 0x033d, 0x033e, 0x033f,
+    0x0346, 0x034a, 0x034b, 0x034c, 0x0350, 0x0351, 0x0352, 0x0357,
+    0x035b, 0x0363, 0x0364, 0x0365, 0x0366, 0x0367, 0x0368, 0x0369,
+    0x036a, 0x036b, 0x036c, 0x036d, 0x036e, 0x036f, 0x0483, 0x0484,
+    0x0485, 0x0486, 0x0487, 0x0592, 0x0593, 0x0594, 0x0595, 0x0597,
+    0x0598, 0x0599, 0x059c, 0x059d, 0x059e, 0x059f, 0x05a0, 0x05a1,
+    0x05a8, 0x05a9, 0x05ab, 0x05ac, 0x05af, 0x05c4, 0x0610, 0x0611,
+    0x0612, 0x0613, 0x0614, 0x0615, 0x0616, 0x0617, 0x0657, 0x0658,
+};
+
+fn placeholderGrid(buffer: []u8, image_id: u32, size: CellSize, clear: bool) ![]const u8 {
+    var writer = std.Io.Writer.fixed(buffer);
+    try writer.writeAll("\x1b7");
+    if (clear) try writer.writeAll("\x1b[2J");
+    try writer.print("\x1b[0m\x1b[38;2;{d};{d};{d}m", .{ (image_id >> 16) & 255, (image_id >> 8) & 255, image_id & 255 });
+    const cols = @min(64, size.cols -| 2);
+    const rows = @min(16, size.rows -| 1);
+    for (0..rows) |row| {
+        try writer.print("\x1b[{d};3H", .{row + 2});
+        for (0..cols) |col| {
+            try writer.writeAll("\u{10eeee}");
+            for ([_]u21{ diacritics[row], diacritics[col] }) |codepoint| {
+                var encoded: [4]u8 = undefined;
+                const len = try std.unicode.utf8Encode(codepoint, &encoded);
+                try writer.writeAll(encoded[0..len]);
+            }
+        }
+    }
+    try writer.writeAll("\x1b[0m\x1b8");
+    return writer.buffered();
+}
+
+fn kittyChunk(buffer: []u8, payload: []const u8, first: bool, more: bool, image_id: u32, virtual: bool) ![]const u8 {
     var writer = std.Io.Writer.fixed(buffer);
     if (first) {
-        try writer.print("\x1b_Ga=T,f=24,o=z,s={d},v={d},c=64,r=16,i=1,q=2,C=1,m={d};", .{ kitty_width, kitty_height, @intFromBool(more) });
+        try writer.print("\x1b_Ga=T,f=24,o=z,s={d},v={d},c=64,r=16,i={d},q=2,C=1,{s}m={d};", .{ kitty_width, kitty_height, image_id, if (virtual) "U=1," else "", @intFromBool(more) });
     } else try writer.print("\x1b_Gm={d};", .{@intFromBool(more)});
     try writer.writeAll(payload);
     try writer.writeAll("\x1b\\");
@@ -528,7 +609,7 @@ test "Kitty chunks preserve payload and use one image ID for updates" {
     var offset: usize = 0;
     while (offset < payload.len) {
         const end = @min(offset + 4096, payload.len);
-        const apc = try kittyChunk(&command, payload[offset..end], offset == 0, end < payload.len);
+        const apc = try kittyChunk(&command, payload[offset..end], offset == 0, end < payload.len, 1, false);
         try std.testing.expect(std.mem.startsWith(u8, apc, "\x1b_G"));
         try std.testing.expect(std.mem.endsWith(u8, apc, "\x1b\\"));
         try std.testing.expect(std.mem.indexOf(u8, apc, if (end < payload.len) "m=1;" else "m=0;") != null);
@@ -618,6 +699,8 @@ test "unknown terminal requires explicit graphics selection" {
 
 test "unchanged OLED VRAM performs no writes or uploads" {
     var ui: Ui = undefined;
+    ui.protocol = .kitty;
+    ui.transport = .direct;
     ui.has_presented_frame = true;
     ui.frames_presented = 4;
     ui.bytes_written = 100;
@@ -641,4 +724,23 @@ test "left arrow and enhanced explicit button hold controls" {
     try std.testing.expect(bus.button_pressed);
     try std.testing.expect(ui.processInput(&bus, "\x1b[117;1:1u"));
     try std.testing.expect(!bus.button_pressed);
+}
+
+test "tmux images use virtual placements while direct images stay physical" {
+    var buffer: [256]u8 = undefined;
+    const virtual = try kittyChunk(&buffer, "AAAA", true, false, 0x123456, true);
+    try std.testing.expect(std.mem.indexOf(u8, virtual, "i=1193046,q=2,C=1,U=1,m=0;") != null);
+    const direct = try kittyChunk(&buffer, "AAAA", true, false, 1, false);
+    try std.testing.expect(std.mem.indexOf(u8, direct, "U=1") == null);
+}
+
+test "placeholder grid encodes image ID and explicit row and column coordinates" {
+    var buffer: [12000]u8 = undefined;
+    const grid = try placeholderGrid(&buffer, 0x123456, .{ .cols = 4, .rows = 3 }, false);
+    try std.testing.expectEqualStrings("\x1b7\x1b[0m\x1b[38;2;18;52;86m\x1b[2;3H\u{10eeee}\u{305}\u{305}\u{10eeee}\u{305}\u{30d}\x1b[3;3H\u{10eeee}\u{30d}\u{305}\u{10eeee}\u{30d}\u{30d}\x1b[0m\x1b8", grid);
+    const empty = try placeholderGrid(&buffer, 1, .{ .cols = 1, .rows = 1 }, true);
+    try std.testing.expect(std.mem.indexOf(u8, empty, "\u{10eeee}") == null);
+    try std.testing.expect(std.mem.indexOf(u8, empty, "\x1b[2J") != null);
+    const full = try placeholderGrid(&buffer, 1, .{ .cols = 80, .rows = 24 }, false);
+    try std.testing.expectEqual(@as(usize, 64 * 16), std.mem.count(u8, full, "\u{10eeee}"));
 }

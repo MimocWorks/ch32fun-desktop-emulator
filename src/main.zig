@@ -116,13 +116,19 @@ const Emulator = struct {
                 const upload_delta = snapshot.ui_texture_uploads - stats_last_snapshot.ui_texture_uploads;
                 const acquire_delta = snapshot.ui_acquire_timeout_count - stats_last_snapshot.ui_acquire_timeout_count;
                 const bytes_delta = snapshot.ui_bytes_written - stats_last_snapshot.ui_bytes_written;
-                std.log.info("stats fps={d:.1} step/s={d:.0} uploads/s={d:.1} output={d:.1} KiB/s acquire_timeout/s={d:.1}", .{
+                var stats_buffer: [512]u8 = undefined;
+                const message = try std.fmt.bufPrint(&stats_buffer, "stats fps={d:.1} step/s={d:.0} uploads/s={d:.1} output={d:.1} KiB/s acquire_timeout/s={d:.1}", .{
                     @as(f64, @floatFromInt(frame_delta)) / elapsed_s,
                     @as(f64, @floatFromInt(cpu_delta)) / elapsed_s,
                     @as(f64, @floatFromInt(upload_delta)) / elapsed_s,
                     @as(f64, @floatFromInt(bytes_delta)) / elapsed_s / 1024.0,
                     @as(f64, @floatFromInt(acquire_delta)) / elapsed_s,
                 });
+                if (self.ui) |*ui| {
+                    if (ui.protocol == .kitty and ui.transport == .tmux) {
+                        try ui.writeStatus(message);
+                    } else std.log.info("{s}", .{message});
+                } else std.log.info("{s}", .{message});
                 stats_last_ns = now_ns;
                 stats_last_snapshot = snapshot;
             }

@@ -146,9 +146,16 @@ If the image is missing, check `tmux show -gv allow-passthrough`, inherited
 terminal hints, and the explicit options above. A failed/slow native query
 falls back to passthrough; it does not prove passthrough is enabled. SSH and
 nested multiplexers may require additional configuration; nested tmux wrapping
-is not implemented. Passthrough images are outside tmux's pane image tracking:
-keep the emulator pane visible and avoid resizing/switching panes while checking
-for image placement. Exit frees image ID 1 rather than deleting other images.
+is not implemented. tmux passthrough uses Kitty Unicode placeholders (`U=1`): image data passes
+through DCS, but the visible cells go through tmux's normal text grid. This keeps
+the display attached to its pane across pane/window switches, clipping and
+redraws. Ghostty 1.4.0 and Kitty support this protocol extension; other terminals
+need Unicode-placeholder support, not just basic Kitty graphics. Direct/native
+transport keeps regular placements. Each instance uses a random nonzero 24-bit
+image ID, and exit frees only that image. Resize redraws the placeholder grid;
+small panes clip the 64×16-cell image to the available space. The grid is emitted
+once per layout change, and `--stats` stays on the top line so it cannot scroll
+the image cells away.
 
 Space uses a 600 ms renewable pulse inside tmux, including enhanced keyboard
 presses, so a missing release cannot leave it stuck. Real release ends the pulse
@@ -184,9 +191,13 @@ and image deletion, checks termios/keyboard/cursor cleanup on q/Esc/Ctrl-C, and
 runs Sixel/headless regressions. It also simulates native and passthrough query
 replies with no terminal environment hints. `--through-tmux` starts an isolated
 tmux server with passthrough enabled and verifies the outgoing APC stream.
-It never changes the user's tmux server settings.
+It never changes the user's tmux server settings. The tmux regression also
+splits panes, selects another pane/window, and checks that placeholder cells
+remain in the owning pane and are absent from the other pane/window. This checks
+tmux's cell ownership and virtual-only image commands, not Ghostty's renderer.
 
-Measured on macOS with Zig 0.17.1 ReleaseFast, three seconds per run:
+Baseline measurements before the Unicode-placeholder pane fix, on macOS with
+Zig 0.17.1 ReleaseFast, three seconds per run (not current pane-fix measurements):
 
 | Target | Transport to PTY | FPS from stats | Million steps/s | Graphics KiB/s | Sampled RSS KiB | Press / release to PTY (ms) |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -207,7 +218,15 @@ Latency has only one press/release sample per run and includes firmware and
 harness scheduling. It ends at the PTY, not physical display refresh. Short
 runs cannot establish worst-case latency or statistical performance equivalence.
 
-All Zig tests passed with Zig 0.17.0 and 0.17.1. CPU execution, zlib compression,
+After the pane fix, all 22 Zig tests passed with Zig 0.17.0 and 0.17.1.
+The split-pane/window regression passed through actual tmux 3.7b at both 30
+and 60 FPS targets (stats: 29/58 FPS; about 28.83 million instructions/s).
+The placeholder grid costs roughly 8 KiB once per layout change; resize/split
+checks deliberately trigger additional grid output. In these short runs,
+startup and resize traffic raises the reported output average. Uploading frames
+with an unchanged layout does not resend the grid.
+
+ CPU execution, zlib compression,
 nearest-neighbor scaling, and VRAM-change suppression remain in place. Ghostty
 UI automation was denied by the computer-use tool, so actual Ghostty rendering,
 flicker/residual images, and physical key behavior are **not verified**. Manual

@@ -57,6 +57,7 @@ def run(core, firmware, transport, fps, seconds, key=b"q", native=False, graphic
     proc = subprocess.Popen(cmd, stdin=slave, stdout=slave, stderr=slave, env=env)
     output = bytearray()
     started = time.monotonic()
+    pane_checks = False
     sent = False
     replied = False
     latency = []
@@ -71,6 +72,25 @@ def run(core, firmware, transport, fps, seconds, key=b"q", native=False, graphic
                 os.write(master, (b"d", b"u")[event_index])
                 awaiting = (time.monotonic(), (0, 255)[event_index], len(decode_frames(bytes(output))))
                 event_index += 1
+            if through_tmux and seconds >= 2 and elapsed >= 1.0 and not pane_checks:
+                def control(*args):
+                    return subprocess.check_output(["tmux", "-L", socket, *args])
+                original = control("display-message", "-p", "#{pane_id}").decode().strip()
+                other = control("split-window", "-h", "-d", "-P", "-F", "#{pane_id}", "sleep 15").decode().strip()
+                marker = "\U0010eeee".encode()
+                assert marker in control("capture-pane", "-p", "-t", original), "image cells missing from owning pane"
+                control("select-pane", "-t", other)
+                assert marker not in control("capture-pane", "-p", "-t", other), "image cells leaked into other pane"
+                control("select-pane", "-t", original)
+                assert marker in control("capture-pane", "-p", "-t", original), "image cells lost on return"
+                window = control("new-window", "-d", "-P", "-F", "#{window_id}", "sleep 15").decode().strip()
+                control("select-window", "-t", window)
+                assert marker not in control("capture-pane", "-p"), "image cells leaked into other window"
+                control("select-pane", "-t", original)
+                control("select-window", "-t", original)
+                control("kill-window", "-t", window)
+                control("kill-pane", "-t", other)
+                pane_checks = True
             if elapsed > seconds and not sent:
                 os.write(master, key)
                 sent = True
@@ -121,14 +141,22 @@ def run(core, firmware, transport, fps, seconds, key=b"q", native=False, graphic
     frames = decode_frames(raw)
     if graphics != "sixel":
         assert len(frames) >= 2 and any(frame != frames[0] for frame in frames[1:])
-        assert b"a=d,d=I,i=1,q=2" in unwrapped
+        image_ids = re.findall(rb"a=T,[^;]*?i=(\d+),", unwrapped)
+        assert image_ids and len(set(image_ids)) == 1
+        assert b"a=d,d=I,i=" + image_ids[0] + b",q=2" in unwrapped
+        uses_placeholders = transport != "direct" and (not native or passthrough_reply)
+        if uses_placeholders:
+            assert b"U=1" in unwrapped
+            assert "\U0010eeee".encode() in unwrapped
+        else:
+            assert b"U=1" not in unwrapped
     else:
         assert b"\x1bPq" in raw
     if graphics != "sixel" and seconds >= 2:
         assert len(latency) == 2, ("button did not update OLED", latency)
     stats = re.findall(rb"stats fps=([\d.]+) step/s=([\d.]+).*?output=([\d.]+)", raw)
     result = dict(transport=transport, native_reply=native, graphics=graphics, target_fps=fps,
-                  frames=len(frames), peak_sampled_rss_kib=rss, captured_bytes=len(raw), input_to_pty_ms=latency)
+                  frames=len(frames), pane_switch_checks=pane_checks, peak_sampled_rss_kib=rss, captured_bytes=len(raw), input_to_pty_ms=latency)
     if stats:
         for index, name in enumerate(["fps", "steps_per_s", "kib_per_s"]):
             result[name] = round(sum(float(row[index]) for row in stats) / len(stats), 2)
