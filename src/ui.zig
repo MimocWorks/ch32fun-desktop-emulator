@@ -459,38 +459,33 @@ fn terminalCellSize() CellSize {
     return .{ .cols = size.col, .rows = size.row };
 }
 
-// First 64 entries of Kitty's canonical rowcolumn-diacritics.txt. Explicit
-// row AND column markers survive tmux clipping, horizontal splits and redraws.
+// First 16 row markers from Kitty's canonical rowcolumn-diacritics.txt.
+// Columns follow the protocol's left-to-right inheritance rule. A single
+// combining mark per cell avoids tmux rewriting partial multi-mark graphemes.
 const diacritics = [_]u21{
     0x0305, 0x030d, 0x030e, 0x0310, 0x0312, 0x033d, 0x033e, 0x033f,
     0x0346, 0x034a, 0x034b, 0x034c, 0x0350, 0x0351, 0x0352, 0x0357,
-    0x035b, 0x0363, 0x0364, 0x0365, 0x0366, 0x0367, 0x0368, 0x0369,
-    0x036a, 0x036b, 0x036c, 0x036d, 0x036e, 0x036f, 0x0483, 0x0484,
-    0x0485, 0x0486, 0x0487, 0x0592, 0x0593, 0x0594, 0x0595, 0x0597,
-    0x0598, 0x0599, 0x059c, 0x059d, 0x059e, 0x059f, 0x05a0, 0x05a1,
-    0x05a8, 0x05a9, 0x05ab, 0x05ac, 0x05af, 0x05c4, 0x0610, 0x0611,
-    0x0612, 0x0613, 0x0614, 0x0615, 0x0616, 0x0617, 0x0657, 0x0658,
 };
 
 fn placeholderGrid(buffer: []u8, image_id: u32, size: CellSize, clear: bool) ![]const u8 {
     var writer = std.Io.Writer.fixed(buffer);
-    try writer.writeAll("\x1b7");
+    // Batch the text grid in tmux so it emits completed graphemes instead of
+    // base/combining-mark backspace rewrites that confuse placeholder rows.
+    try writer.writeAll("\x1b[?2026h\x1b7");
     if (clear) try writer.writeAll("\x1b[2J");
     try writer.print("\x1b[0m\x1b[38;2;{d};{d};{d}m", .{ (image_id >> 16) & 255, (image_id >> 8) & 255, image_id & 255 });
     const cols = @min(64, size.cols -| 2);
     const rows = @min(16, size.rows -| 1);
     for (0..rows) |row| {
         try writer.print("\x1b[{d};3H", .{row + 2});
-        for (0..cols) |col| {
+        for (0..cols) |_| {
             try writer.writeAll("\u{10eeee}");
-            for ([_]u21{ diacritics[row], diacritics[col] }) |codepoint| {
-                var encoded: [4]u8 = undefined;
-                const len = try std.unicode.utf8Encode(codepoint, &encoded);
-                try writer.writeAll(encoded[0..len]);
-            }
+            var encoded: [4]u8 = undefined;
+            const len = try std.unicode.utf8Encode(diacritics[row], &encoded);
+            try writer.writeAll(encoded[0..len]);
         }
     }
-    try writer.writeAll("\x1b[0m\x1b8");
+    try writer.writeAll("\x1b[0m\x1b8\x1b[?2026l");
     return writer.buffered();
 }
 
@@ -734,10 +729,10 @@ test "tmux images use virtual placements while direct images stay physical" {
     try std.testing.expect(std.mem.indexOf(u8, direct, "U=1") == null);
 }
 
-test "placeholder grid encodes image ID and explicit row and column coordinates" {
+test "placeholder grid encodes image ID and row coordinates with implicit columns" {
     var buffer: [12000]u8 = undefined;
     const grid = try placeholderGrid(&buffer, 0x123456, .{ .cols = 4, .rows = 3 }, false);
-    try std.testing.expectEqualStrings("\x1b7\x1b[0m\x1b[38;2;18;52;86m\x1b[2;3H\u{10eeee}\u{305}\u{305}\u{10eeee}\u{305}\u{30d}\x1b[3;3H\u{10eeee}\u{30d}\u{305}\u{10eeee}\u{30d}\u{30d}\x1b[0m\x1b8", grid);
+    try std.testing.expectEqualStrings("\x1b[?2026h\x1b7\x1b[0m\x1b[38;2;18;52;86m\x1b[2;3H\u{10eeee}\u{305}\u{10eeee}\u{305}\x1b[3;3H\u{10eeee}\u{30d}\u{10eeee}\u{30d}\x1b[0m\x1b8\x1b[?2026l", grid);
     const empty = try placeholderGrid(&buffer, 1, .{ .cols = 1, .rows = 1 }, true);
     try std.testing.expect(std.mem.indexOf(u8, empty, "\u{10eeee}") == null);
     try std.testing.expect(std.mem.indexOf(u8, empty, "\x1b[2J") != null);

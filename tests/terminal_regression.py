@@ -31,6 +31,22 @@ def decode_frames(raw):
     return frames
 
 
+ROW_MARKERS = [0x305, 0x30d, 0x30e, 0x310, 0x312, 0x33d, 0x33e, 0x33f,
+               0x346, 0x34a, 0x34b, 0x34c, 0x350, 0x351, 0x352, 0x357]
+
+
+def verify_placeholder_coordinates(raw):
+    # Check what tmux sends to the outer terminal, not just capture-pane text.
+    # Previously each cell was emitted in partial forms (zero/one/two marks),
+    # which passed the pane ownership test but could render repeated image bands.
+    text = raw.decode("utf8", errors="replace")
+    marks = re.findall("\U0010eeee([\u0300-\u036f]*)", text)
+    assert len(marks) >= 64 * 16, "incomplete initial image grid"
+    assert all(len(mark) == 1 and ord(mark) in ROW_MARKERS for mark in marks), "partial or ambiguous image cell coordinates"
+    expected = [chr(mark) for mark in ROW_MARKERS for _ in range(64)]
+    assert marks[:64 * 16] == expected, "image row coordinates changed through tmux"
+
+
 def run(core, firmware, transport, fps, seconds, key=b"q", native=False, graphics="kitty", through_tmux=False, unknown=False, passthrough_reply=False):
     master, slave = pty.openpty()
     before = termios.tcgetattr(slave)
@@ -138,6 +154,8 @@ def run(core, firmware, transport, fps, seconds, key=b"q", native=False, graphic
     unwrapped = raw
     if wrapped:
         unwrapped = raw.replace(b"\x1bPtmux;", b"").replace(b"\x1b\x1b", b"\x1b").replace(b"\x1b\\\x1b\\", b"\x1b\\")
+    if through_tmux:
+        verify_placeholder_coordinates(raw)
     frames = decode_frames(raw)
     if graphics != "sixel":
         assert len(frames) >= 2 and any(frame != frames[0] for frame in frames[1:])
@@ -171,6 +189,12 @@ def main():
     parser.add_argument("--target-fps", type=int, default=30)
     parser.add_argument("--seconds", type=float, default=3)
     args = parser.parse_args()
+    try:
+        verify_placeholder_coordinates(("\U0010eeee\b\U0010eeee\u0305\b\U0010eeee\u0305\u0305" * 1024).encode())
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("coordinate regression accepted the old broken wire form")
     if args.through_tmux:
         print(json.dumps(run(args.core, args.firmware, "tmux", args.target_fps, args.seconds, through_tmux=True), indent=2))
         return

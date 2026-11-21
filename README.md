@@ -195,6 +195,12 @@ It never changes the user's tmux server settings. The tmux regression also
 splits panes, selects another pane/window, and checks that placeholder cells
 remain in the owning pane and are absent from the other pane/window. This checks
 tmux's cell ownership and virtual-only image commands, not Ghostty's renderer.
+It also validates the actual outgoing placeholder row coordinates: cells use
+one row diacritic with implicit columns, and synchronized grid updates avoid
+partial base/diacritic backspace rewrites. The first complete 64×16 grid must
+retain all 16 distinct row markers through tmux. This rejects partial-coordinate
+wire output missed by the earlier presence-only check. Actual display still
+requires verification in the outer terminal.
 
 Baseline measurements before the Unicode-placeholder pane fix, on macOS with
 Zig 0.17.1 ReleaseFast, three seconds per run (not current pane-fix measurements):
@@ -221,7 +227,7 @@ runs cannot establish worst-case latency or statistical performance equivalence.
 After the pane fix, all 22 Zig tests passed with Zig 0.17.0 and 0.17.1.
 The split-pane/window regression passed through actual tmux 3.7b at both 30
 and 60 FPS targets (stats: 29/58 FPS; about 28.83 million instructions/s).
-The placeholder grid costs roughly 8 KiB once per layout change; resize/split
+The placeholder grid costs roughly 6 KiB once per layout change; resize/split
 checks deliberately trigger additional grid output. In these short runs,
 startup and resize traffic raises the reported output average. Uploading frames
 with an unchanged layout does not resend the grid.
