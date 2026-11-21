@@ -23,6 +23,7 @@ const RuntimeOptions = struct {
     cpu_slice_steps: usize = 50_000,
     target_frame_ns: u64 = std.time.ns_per_s / 60,
     enable_stats: bool = false,
+    kitty_transport: ui_mod.Transport = .auto,
     graphics_protocol: ui_mod.Protocol = .auto,
 };
 
@@ -51,7 +52,7 @@ const Emulator = struct {
         const cpu = cpu_mod.Cpu.init(image.entry, bus_mod.ram_base + bus_mod.ram_size);
         var ui: ?ui_mod.Ui = null;
         if (enable_ui) {
-            ui = try ui_mod.Ui.init(allocator, io, options.graphics_protocol, environ);
+            ui = try ui_mod.Ui.init(allocator, io, options.graphics_protocol, options.kitty_transport, environ);
         }
         return .{
             .allocator = allocator,
@@ -76,7 +77,7 @@ const Emulator = struct {
         var stats_last_snapshot = self.statsSnapshot();
 
         if (self.ui) |*ui| {
-            _ = ui.pumpEvents(&self.bus);
+            if (!ui.pumpEvents(&self.bus)) return;
             try ui.present(&self.bus);
             next_present_ns += frame_interval_ns;
         }
@@ -238,6 +239,10 @@ pub fn main(init: std.process.Init) !void {
             const fps = try std.fmt.parseInt(u32, raw, 10);
             if (fps == 0) return error.InvalidUsage;
             options.target_frame_ns = std.time.ns_per_s / fps;
+        } else if (std.mem.eql(u8, arg, "--kitty-transport")) {
+            if (arg_index == args.len) return error.InvalidUsage;
+            options.kitty_transport = std.meta.stringToEnum(ui_mod.Transport, args[arg_index]) orelse return error.InvalidUsage;
+            arg_index += 1;
         } else if (std.mem.eql(u8, arg, "--graphics")) {
             if (arg_index == args.len) return error.InvalidUsage;
             const value = args[arg_index];

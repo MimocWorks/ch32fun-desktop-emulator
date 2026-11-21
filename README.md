@@ -52,7 +52,7 @@ chemu
 ```
 
 The command runs `zig build`, detects the RISC-V ELF in `zig-out/bin`, and
-starts the emulator with Kitty graphics at 60 FPS by default. Useful launcher options include:
+starts the emulator with automatic graphics selection at 60 FPS by default. Useful launcher options include:
 
 - `--no-build`: run an existing artifact without rebuilding
 - `--firmware PATH`: select an ELF explicitly when the project produces more than one
@@ -77,6 +77,7 @@ Useful options:
 - `--cpu-slice N`: number of CPU steps per execution slice
 - `--target-fps N`: UI presentation target
 - `--graphics auto|kitty|sixel`: select the terminal graphics protocol
+- `--kitty-transport auto|direct|tmux`: select Kitty transport (default: auto)
 - `--headless`: run without terminal graphics
 - `--steps N`: number of instructions to execute in headless mode
 - `--dump-oled`: print the OLED framebuffer as ASCII after headless execution
@@ -104,12 +105,114 @@ zig build run -- --elf /path/to/firmware.elf --headless --steps 200000 --dump-ol
 - `u`: release the tact switch
 - `Esc`, `q`, or `Ctrl-C`: quit
 
-Kitty is selected automatically when `KITTY_WINDOW_ID` or a Kitty `TERM` is detected. Other terminals default to Sixel. Override detection when needed:
+## Ghostty and tmux
+
+Use the same command in Ghostty and Ghostty + tmux:
 
 ```sh
-zig build run -- --elf firmware.elf --graphics kitty --target-fps 60
-zig build run -- --elf firmware.elf --graphics sixel --target-fps 30
+chemu --stats --target-fps 60
+# Explicit selection also works when terminal hints are missing:
+chemu --graphics kitty --stats --target-fps 30
 ```
+
+For tmux, add this to `~/.tmux.conf` and reload the configuration:
+
+```tmux
+set -g allow-passthrough on
+```
+
+`--graphics auto` recognizes `xterm-ghostty`, `TERM_PROGRAM=ghostty`,
+`GHOSTTY_RESOURCES_DIR`, and Kitty's TERM/window hints. These are hints, not a
+capability guarantee. tmux can replace TERM/TERM_PROGRAM; the inherited
+`GHOSTTY_RESOURCES_DIR` or `KITTY_WINDOW_ID` still identifies the outer terminal.
+If hints are absent, auto queries Kitty support directly, then through tmux
+passthrough when applicable (up to 60 ms per route). Without a positive reply,
+explicit selection is required rather than sending unsolicited images.
+A TERM containing `sixel` selects Sixel; `--graphics sixel` remains supported.
+Headless execution performs no terminal detection or graphics output.
+
+Inside `TMUX`, automatic Kitty transport makes a bounded 60 ms native graphics
+query once at startup. A positive reply selects direct APC output; otherwise
+it wraps each APC chunk (including deletion) in tmux DCS passthrough and doubles
+its ESC bytes. Known terminals outside tmux keep direct output without probing. The normal
+keyboard protocol stays on the pane side of tmux. To force a known route:
+
+```sh
+chemu --graphics kitty --kitty-transport tmux
+chemu --graphics kitty --kitty-transport direct
+```
+
+If the image is missing, check `tmux show -gv allow-passthrough`, inherited
+terminal hints, and the explicit options above. A failed/slow native query
+falls back to passthrough; it does not prove passthrough is enabled. SSH and
+nested multiplexers may require additional configuration; nested tmux wrapping
+is not implemented. Passthrough images are outside tmux's pane image tracking:
+keep the emulator pane visible and avoid resizing/switching panes while checking
+for image placement. Exit frees image ID 1 rather than deleting other images.
+
+Space uses a 600 ms renewable pulse inside tmux, including enhanced keyboard
+presses, so a missing release cannot leave it stuck. Real release ends the pulse
+early. Outside tmux enhanced keyboard events retain true press/release behavior.
+For an indefinite hold in tmux use `d`, then `u` to release.
+
+Validation status: macOS, Zig 0.17.1; unit and synthetic PTY tests cover direct
+Kitty, passthrough, native-query selection, Sixel, headless, and terminal cleanup.
+Ghostty 1.4.0 + tmux 3.7b is the reported target environment; actual image display,
+flicker, physical key behavior, and end-to-end input latency still require manual
+verification. Other Kitty/Sixel terminals are not visually verified.
+See [validation](#validation) below for reproducible measurements and limits.
+
+## Validation
+
+Reproduce the synthetic firmware and PTY checks on macOS:
+
+```sh
+zig build test
+zig build -Doptimize=ReleaseFast
+zig cc -target riscv32-freestanding -mcpu=generic_rv32 -nostdlib \
+  -Wl,-T,tests/firmware.ld tests/animated_oled.S -o /tmp/chemu-animated.elf
+python3 tests/terminal_regression.py
+python3 tests/terminal_regression.py --through-tmux --target-fps 30
+python3 tests/terminal_regression.py --through-tmux --target-fps 60
+```
+
+The firmware continuously changes OLED VRAM through I2C; its first pixel mirrors
+PD1 so the harness can verify button press/hold/release through the CPU and OLED.
+It is a synthetic transport workload, not a timing-accurate CH32fun game.
+The harness reconstructs chunks, decodes base64/zlib RGB, verifies changed frames
+and image deletion, checks termios/keyboard/cursor cleanup on q/Esc/Ctrl-C, and
+runs Sixel/headless regressions. It also simulates native and passthrough query
+replies with no terminal environment hints. `--through-tmux` starts an isolated
+tmux server with passthrough enabled and verifies the outgoing APC stream.
+It never changes the user's tmux server settings.
+
+Measured on macOS with Zig 0.17.1 ReleaseFast, three seconds per run:
+
+| Target | Transport to PTY | FPS from stats | Million steps/s | Graphics KiB/s | Sampled RSS KiB | Press / release to PTY (ms) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 30 | Direct | 29.0 | 28.83 | 8.05 | 2592 | 22.21 / 28.20 |
+| 30 | DCS | 29.0 | 28.83 | 8.37 | 2592 | 38.80 / 30.21 |
+| 60 | Direct | 58.0 | 28.83 | 16.10 | 2592 | 11.19 / 28.46 |
+| 60 | DCS | 57.3 | 28.83 | 16.53 | 2592 | 19.63 / 42.04 |
+| 30 | Actual tmux 3.7b → PTY | 29.0 | 28.83 | 8.30 | 3104* | 23.36 / 26.78 |
+| 60 | Actual tmux 3.7b → PTY | 58.0 | 28.83 | 16.75 | 3088* | 30.13 / 28.02 |
+
+Direct and DCS rows compare the two routes in the updated implementation, not
+an earlier release. Stats cover steady-state sampling windows; frame totals
+include startup. Output counts now include Kitty APC headers, terminators,
+cursor positioning, and DCS overhead (older versions counted only base64).
+DCS adds 11 bytes per image APC. Memory is sampled with `ps`, not an allocation
+profiler; *actual-tmux rows sample the tmux client, not emulator/whole server RSS.
+Latency has only one press/release sample per run and includes firmware and
+harness scheduling. It ends at the PTY, not physical display refresh. Short
+runs cannot establish worst-case latency or statistical performance equivalence.
+
+All Zig tests passed with Zig 0.17.0 and 0.17.1. CPU execution, zlib compression,
+nearest-neighbor scaling, and VRAM-change suppression remain in place. Ghostty
+UI automation was denied by the computer-use tool, so actual Ghostty rendering,
+flicker/residual images, and physical key behavior are **not verified**. Manual
+checks on Ghostty 1.4.0 alone and with tmux 3.7b remain necessary before treating
+the visual issue as confirmed resolved.
 
 ## Helper Script
 

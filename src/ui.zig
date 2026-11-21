@@ -20,6 +20,8 @@ pub const Protocol = enum {
     sixel,
 };
 
+pub const Transport = enum { auto, direct, tmux };
+
 pub const Ui = struct {
     pub const Stats = struct {
         frames_presented: u64,
@@ -29,6 +31,8 @@ pub const Ui = struct {
     };
 
     protocol: Protocol,
+    transport: Transport = .direct,
+    in_tmux: bool = false,
     allocator: std.mem.Allocator,
     io: std.Io,
     original_termios: std.posix.termios,
@@ -41,9 +45,13 @@ pub const Ui = struct {
     bytes_written: u64 = 0,
     last_vram: [128 * 64 / 8]u8 = @splat(0),
     has_presented_frame: bool = false,
+    startup_input: [256]u8 = undefined,
+    startup_input_len: usize = 0,
+    pending_input: [256]u8 = undefined,
+    pending_input_len: usize = 0,
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, protocol: Protocol, environ: *const std.process.Environ.Map) !Ui {
-        const selected = if (protocol == .auto) detectProtocol(environ) else protocol;
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, protocol: Protocol, transport: Transport, environ: *const std.process.Environ.Map) !Ui {
+        var selected = if (protocol == .auto) detectProtocol(environ) catch Protocol.auto else protocol;
         const kitty_rgb = try allocator.alloc(u8, kitty_rgb_len);
         errdefer allocator.free(kitty_rgb);
         const kitty_compressed = try allocator.alloc(u8, kitty_compressed_capacity);
@@ -56,8 +64,29 @@ pub const Ui = struct {
         var raw = original;
         raw.lflag.ICANON = false;
         raw.lflag.ECHO = false;
+        raw.lflag.ISIG = false;
         try std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, raw);
         errdefer std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, original) catch {};
+
+        var startup_input: [256]u8 = undefined;
+        var startup_input_len: usize = 0;
+        var selected_transport = selectTransport(transport, environ);
+        // Query unknown environments, including tmux sessions that did not
+        // inherit any outer-terminal hints. Prefer verified native support.
+        if (selected == .auto) {
+            if (try probeKitty(io, &startup_input, &startup_input_len, if (transport == .auto) .direct else selected_transport)) {
+                selected = .kitty;
+                if (transport == .auto) selected_transport = .direct;
+            } else if (transport == .auto and environ.get("TMUX") != null and try probeKitty(io, &startup_input, &startup_input_len, .tmux)) {
+                selected = .kitty;
+                selected_transport = .tmux;
+            } else {
+                std.log.err("unknown terminal graphics capability; specify --graphics kitty or --graphics sixel (or --headless)", .{});
+                return error.UnknownGraphicsCapability;
+            }
+        } else if (selected == .kitty and transport == .auto and environ.get("TMUX") != null) {
+            if (try probeKitty(io, &startup_input, &startup_input_len, .direct)) selected_transport = .direct;
+        }
 
         // Older emulator versions accidentally pushed keyboard modes onto the
         // main-screen stack and popped the alternate-screen stack. Clear those
@@ -69,9 +98,13 @@ pub const Ui = struct {
         // alternate screen first so this push is paired with deinit's pop on
         // that same buffer and cannot leak into the user's shell.
         try writeAll(io, "\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H\x1b[>3u");
-        std.log.info("terminal graphics protocol: {s}", .{@tagName(selected)});
+        std.log.info("terminal graphics protocol: {s} (Kitty transport: {s})", .{ @tagName(selected), @tagName(selected_transport) });
         return .{
             .protocol = selected,
+            .transport = selected_transport,
+            .startup_input = startup_input,
+            .startup_input_len = startup_input_len,
+            .in_tmux = environ.get("TMUX") != null,
             .allocator = allocator,
             .io = io,
             .original_termios = original,
@@ -86,8 +119,8 @@ pub const Ui = struct {
         // Pop exactly one Kitty keyboard mode entry before giving stdin back
         // to the shell, then consume key-release reports already in flight.
         writeAll(self.io, "\x1b[<1u") catch {};
-        drainTerminalInput();
-        if (self.protocol == .kitty) writeAll(self.io, "\x1b_Ga=d,d=A,q=2\x1b\\") catch {};
+        drainTerminalInput(self.io);
+        if (self.protocol == .kitty) self.sendKitty("\x1b_Ga=d,d=I,i=1,q=2\x1b\\") catch {};
         writeAll(self.io, "\x1b[?25h\x1b[?1049l") catch {};
         std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, self.original_termios) catch {};
         self.allocator.free(self.kitty_encoded);
@@ -97,10 +130,12 @@ pub const Ui = struct {
     }
 
     pub fn pumpEvents(self: *Ui, bus: *bus_mod.Bus) bool {
-        if (self.button_release_deadline_ns) |deadline| if (nowNs(self.io) >= deadline) {
-            bus.setButtonPressed(false);
-            self.button_release_deadline_ns = null;
-        };
+        self.expireButton(bus, nowNs(self.io));
+        if (self.startup_input_len > 0) {
+            const len = self.startup_input_len;
+            self.startup_input_len = 0;
+            if (!self.processInput(bus, self.startup_input[0..len])) return false;
+        }
 
         var fds = [_]std.posix.pollfd{.{
             .fd = std.posix.STDIN_FILENO,
@@ -114,9 +149,35 @@ pub const Ui = struct {
         return self.processInput(bus, input[0..count]);
     }
 
-    fn processInput(self: *Ui, bus: *bus_mod.Bus, input: []const u8) bool {
+    fn expireButton(self: *Ui, bus: *bus_mod.Bus, now: i96) void {
+        if (self.button_release_deadline_ns) |deadline| if (now >= deadline) {
+            bus.setButtonPressed(false);
+            self.button_release_deadline_ns = null;
+        };
+    }
+
+    fn processInput(self: *Ui, bus: *bus_mod.Bus, incoming: []const u8) bool {
+        if (incoming.len > self.pending_input.len - self.pending_input_len) {
+            self.pending_input_len = 0;
+            return true;
+        }
+        @memcpy(self.pending_input[self.pending_input_len..][0..incoming.len], incoming);
+        self.pending_input_len += incoming.len;
+        const input = self.pending_input[0..self.pending_input_len];
         var index: usize = 0;
         while (index < input.len) {
+            if (input.len - index == 2 and input[index] == 27 and (input[index + 1] == '[' or input[index + 1] == 'O')) {
+                self.keepInputSuffix(index);
+                return true;
+            }
+            if (std.mem.startsWith(u8, input[index..], "\x1b_")) {
+                const end = std.mem.indexOf(u8, input[index + 2 ..], "\x1b\\") orelse {
+                    self.keepInputSuffix(index);
+                    return true;
+                };
+                index += 2 + end + 2;
+                continue;
+            }
             if (input[index] == 0x1b and index + 2 < input.len and input[index + 1] == 'O' and
                 (input[index + 2] == 'C' or input[index + 2] == 'D'))
             {
@@ -127,7 +188,10 @@ pub const Ui = struct {
             if (input[index] == 0x1b and index + 2 < input.len and input[index + 1] == '[') {
                 var final = index + 2;
                 while (final < input.len and (input[final] < 0x40 or input[final] > 0x7e)) : (final += 1) {}
-                if (final == input.len) return true;
+                if (final == input.len) {
+                    self.keepInputSuffix(index);
+                    return true;
+                }
 
                 const final_byte = input[final];
                 const parameters = input[index + 2 .. final];
@@ -172,7 +236,13 @@ pub const Ui = struct {
             }
             index += 1;
         }
+        self.pending_input_len = 0;
         return true;
+    }
+
+    fn keepInputSuffix(self: *Ui, start: usize) void {
+        std.mem.copyForwards(u8, &self.pending_input, self.pending_input[start..self.pending_input_len]);
+        self.pending_input_len -= start;
     }
 
     fn processKittyKey(self: *Ui, bus: *bus_mod.Bus, parameters: []const u8) bool {
@@ -187,7 +257,7 @@ pub const Ui = struct {
             } else {
                 bus.setButtonPressed(true);
             }
-            self.button_release_deadline_ns = null;
+            self.button_release_deadline_ns = if (event != 3 and self.in_tmux) nowNs(self.io) + legacy_button_pulse_ms * std.time.ns_per_ms else null;
         } else if (codepoint == 'd' and event != 3) {
             bus.setButtonPressed(true);
             self.button_release_deadline_ns = null;
@@ -243,23 +313,23 @@ pub const Ui = struct {
         const encoded_len = std.base64.standard.Encoder.calcSize(compressed.len);
         _ = std.base64.standard.Encoder.encode(self.kitty_encoded[0..encoded_len], compressed);
 
+        try writeAll(self.io, "\x1b[2;3H");
+        self.bytes_written += 6;
         var offset: usize = 0;
-        var first = true;
         while (offset < encoded_len) {
+            var command: [4300]u8 = undefined;
             const end = @min(offset + 4096, encoded_len);
-            const more: u8 = if (end < encoded_len) 1 else 0;
-            var header: [160]u8 = undefined;
-            const prefix = if (first)
-                try std.fmt.bufPrint(&header, "\x1b[2;3H\x1b_Ga=T,f=24,o=z,s={d},v={d},c=64,r=16,i=1,q=2,C=1,m={d};", .{ kitty_width, kitty_height, more })
-            else
-                try std.fmt.bufPrint(&header, "\x1b_Gm={d};", .{more});
-            try writeAll(self.io, prefix);
-            try writeAll(self.io, self.kitty_encoded[offset..end]);
-            try writeAll(self.io, "\x1b\\");
-            first = false;
+            const apc = try kittyChunk(&command, self.kitty_encoded[offset..end], offset == 0, end < encoded_len);
+            try self.sendKitty(apc);
             offset = end;
         }
-        self.bytes_written += encoded_len;
+    }
+
+    fn sendKitty(self: *Ui, apc: []const u8) !void {
+        var buffer: [8700]u8 = undefined;
+        const output = try wrapKitty(&buffer, apc, self.transport);
+        try writeAll(self.io, output);
+        self.bytes_written += output.len;
     }
 
     pub fn stats(self: *const Ui) Stats {
@@ -273,7 +343,8 @@ pub const Ui = struct {
 };
 
 fn keyEventType(parameters: []const u8) u8 {
-    const colon = std.mem.indexOfScalar(u8, parameters, ':') orelse return 1;
+    const modifiers = std.mem.indexOfScalar(u8, parameters, ';') orelse return 1;
+    const colon = std.mem.indexOfScalarPos(u8, parameters, modifiers + 1, ':') orelse return 1;
     const event_end = std.mem.indexOfScalarPos(u8, parameters, colon + 1, ';') orelse parameters.len;
     return std.fmt.parseInt(u8, parameters[colon + 1 .. event_end], 10) catch 1;
 }
@@ -282,7 +353,8 @@ fn nowNs(io: std.Io) i96 {
     return std.Io.Clock.awake.now(io).nanoseconds;
 }
 
-fn drainTerminalInput() void {
+fn drainTerminalInput(io: std.Io) void {
+    const deadline = nowNs(io) + 60 * std.time.ns_per_ms;
     var fds = [_]std.posix.pollfd{.{
         .fd = std.posix.STDIN_FILENO,
         .events = std.posix.POLL.IN,
@@ -291,27 +363,84 @@ fn drainTerminalInput() void {
     var discard: [128]u8 = undefined;
     // Wait for a short quiet period because a key-up report may be emitted
     // just after the keyboard protocol is disabled.
-    while ((std.posix.poll(&fds, 25) catch return) != 0) {
-        _ = std.posix.read(std.posix.STDIN_FILENO, &discard) catch return;
+    while (nowNs(io) < deadline and (std.posix.poll(&fds, 25) catch return) != 0) {
+        if ((std.posix.read(std.posix.STDIN_FILENO, &discard) catch return) == 0) return;
         fds[0].revents = 0;
     }
 }
 
-fn detectProtocol(environ: *const std.process.Environ.Map) Protocol {
-    if (environ.get("KITTY_WINDOW_ID") != null) return .kitty;
-    if (environ.get("TERM")) |term| {
-        if (std.mem.indexOf(u8, term, "kitty") != null) return .kitty;
+// The query does not create an image. Keep ordinary input received during the
+// bounded startup probe; strip only its complete graphics response.
+fn probeKitty(io: std.Io, input: []u8, len: *usize, transport: Transport) !bool {
+    var buffer: [128]u8 = undefined;
+    try writeAll(io, try wrapKitty(&buffer, "\x1b_Ga=q,i=2147483646,f=24,s=1,v=1;AAAA\x1b\\", transport));
+    const deadline = nowNs(io) + 60 * std.time.ns_per_ms;
+    while (len.* < input.len) {
+        const remaining = deadline - nowNs(io);
+        if (remaining <= 0) break;
+        var fds = [_]std.posix.pollfd{.{ .fd = std.posix.STDIN_FILENO, .events = std.posix.POLL.IN, .revents = 0 }};
+        if (try std.posix.poll(&fds, @intCast(@max(1, @divTrunc(remaining, std.time.ns_per_ms)))) == 0) break;
+        const count = try std.posix.read(std.posix.STDIN_FILENO, input[len.*..]);
+        if (count == 0) break;
+        len.* += count;
+        if (takeProbeReply(input, len)) |supported| return supported;
     }
-    return .sixel;
+    return false;
+}
+
+fn takeProbeReply(input: []u8, len: *usize) ?bool {
+    const start = std.mem.indexOf(u8, input[0..len.*], "\x1b_Gi=2147483646;") orelse return null;
+    const end = start + (std.mem.indexOf(u8, input[start..len.*], "\x1b\\") orelse return null) + 2;
+    const supported = std.mem.endsWith(u8, input[start..end], ";OK\x1b\\");
+    std.mem.copyForwards(u8, input[start..], input[end..len.*]);
+    len.* -= end - start;
+    return supported;
+}
+
+fn selectTransport(requested: Transport, environ: *const std.process.Environ.Map) Transport {
+    return if (requested != .auto) requested else if (environ.get("TMUX") != null) .tmux else .direct;
+}
+
+fn detectProtocol(environ: *const std.process.Environ.Map) !Protocol {
+    if (environ.get("KITTY_WINDOW_ID") != null or environ.get("GHOSTTY_RESOURCES_DIR") != null) return .kitty;
+    if (environ.get("TERM_PROGRAM")) |program| {
+        if (std.mem.eql(u8, program, "ghostty") or std.mem.eql(u8, program, "kitty")) return .kitty;
+    }
+    if (environ.get("TERM")) |term| {
+        if (std.mem.indexOf(u8, term, "kitty") != null or std.mem.eql(u8, term, "xterm-ghostty")) return .kitty;
+        if (std.mem.indexOf(u8, term, "sixel") != null) return .sixel;
+    }
+    return error.UnknownGraphicsCapability;
+}
+
+fn kittyChunk(buffer: []u8, payload: []const u8, first: bool, more: bool) ![]const u8 {
+    var writer = std.Io.Writer.fixed(buffer);
+    if (first) {
+        try writer.print("\x1b_Ga=T,f=24,o=z,s={d},v={d},c=64,r=16,i=1,q=2,C=1,m={d};", .{ kitty_width, kitty_height, @intFromBool(more) });
+    } else try writer.print("\x1b_Gm={d};", .{@intFromBool(more)});
+    try writer.writeAll(payload);
+    try writer.writeAll("\x1b\\");
+    return writer.buffered();
+}
+
+fn wrapKitty(buffer: []u8, apc: []const u8, transport: Transport) ![]const u8 {
+    if (transport != .tmux) return apc;
+    var writer = std.Io.Writer.fixed(buffer);
+    try writer.writeAll("\x1bPtmux;");
+    for (apc) |byte| {
+        try writer.writeByte(byte);
+        if (byte == 27) try writer.writeByte(byte);
+    }
+    try writer.writeAll("\x1b\\");
+    return writer.buffered();
 }
 
 fn pixel(bus: *const bus_mod.Bus, x: usize, y: usize) bool {
     return (bus.oled.vram[(y / 8) * 128 + x] & (@as(u8, 1) << @as(u3, @intCast(y & 7)))) != 0;
 }
 
-fn presentSixel(io: std.Io, bus: *const bus_mod.Bus) !void {
-    var output: [4096]u8 = undefined;
-    var stream = std.Io.Writer.fixed(&output);
+fn encodeSixel(output: []u8, bus: *const bus_mod.Bus) ![]const u8 {
+    var stream = std.Io.Writer.fixed(output);
     try stream.writeAll("\x1b7\x1b[2;3H\x1bPq\"1;1;128;64#0;2;0;0;0#1;2;100;100;100");
 
     var band: usize = 0;
@@ -331,7 +460,12 @@ fn presentSixel(io: std.Io, bus: *const bus_mod.Bus) !void {
         if (band + 6 < 64) try stream.writeByte('-');
     }
     try stream.writeAll("\x1b\\\x1b8");
-    try writeAll(io, stream.buffered());
+    return stream.buffered();
+}
+
+fn presentSixel(io: std.Io, bus: *const bus_mod.Bus) !void {
+    var output: [4096]u8 = undefined;
+    try writeAll(io, try encodeSixel(&output, bus));
 }
 
 fn writeAll(io: std.Io, bytes: []const u8) !void {
@@ -340,11 +474,15 @@ fn writeAll(io: std.Io, bytes: []const u8) !void {
 
 test "sixel encoder emits a complete frame" {
     const bus = bus_mod.Bus{};
-    _ = bus;
+    var output: [4096]u8 = undefined;
+    const frame = try encodeSixel(&output, &bus);
+    try std.testing.expect(std.mem.startsWith(u8, frame, "\x1b7\x1b[2;3H\x1bPq"));
+    try std.testing.expect(std.mem.endsWith(u8, frame, "\x1b\\\x1b8"));
 }
 
 test "right arrow emits a complete clockwise quadrature cycle" {
     var ui: Ui = undefined;
+    ui.pending_input_len = 0;
     var bus = bus_mod.Bus{};
 
     try std.testing.expect(ui.processInput(&bus, "\x1b[C"));
@@ -363,10 +501,144 @@ test "right arrow emits a complete clockwise quadrature cycle" {
 
 test "Kitty enhanced arrow press is accepted and release is ignored" {
     var ui: Ui = undefined;
+    ui.pending_input_len = 0;
     var bus = bus_mod.Bus{};
 
     try std.testing.expect(ui.processInput(&bus, "\x1b[1;1:1C"));
     try std.testing.expectEqual(@as(u3, 1), bus.rotary_phase);
     try std.testing.expect(ui.processInput(&bus, "\x1b[1;1:3D"));
     try std.testing.expectEqual(@as(i16, 0), bus.rotary_pending);
+}
+
+test "tmux escapes every ESC and direct transport preserves APC" {
+    var buffer: [128]u8 = undefined;
+    const apc = "\x1b_Gm=0;AAAA\x1b\\";
+    try std.testing.expectEqualStrings(apc, try wrapKitty(&buffer, apc, .direct));
+    try std.testing.expectEqualStrings("\x1bPtmux;\x1b\x1b_Gm=0;AAAA\x1b\x1b\\\x1b\\", try wrapKitty(&buffer, apc, .tmux));
+    const deletion = "\x1b_Ga=d,d=I,i=1,q=2\x1b\\";
+    const wrapped = try wrapKitty(&buffer, deletion, .tmux);
+    try std.testing.expect(std.mem.indexOf(u8, wrapped, "a=d,d=I,i=1") != null);
+}
+
+test "Kitty chunks preserve payload and use one image ID for updates" {
+    var payload: [9000]u8 = @splat('A');
+    payload[8999] = 'B';
+    var command: [4300]u8 = undefined;
+    var reconstructed: [9000]u8 = undefined;
+    var offset: usize = 0;
+    while (offset < payload.len) {
+        const end = @min(offset + 4096, payload.len);
+        const apc = try kittyChunk(&command, payload[offset..end], offset == 0, end < payload.len);
+        try std.testing.expect(std.mem.startsWith(u8, apc, "\x1b_G"));
+        try std.testing.expect(std.mem.endsWith(u8, apc, "\x1b\\"));
+        try std.testing.expect(std.mem.indexOf(u8, apc, if (end < payload.len) "m=1;" else "m=0;") != null);
+        if (offset == 0) try std.testing.expect(std.mem.indexOf(u8, apc, "i=1,q=2,C=1") != null);
+        const start = (std.mem.indexOfScalar(u8, apc, ';') orelse unreachable) + 1;
+        @memcpy(reconstructed[offset..end], apc[start .. apc.len - 2]);
+        offset = end;
+    }
+    try std.testing.expectEqualSlices(u8, &payload, &reconstructed);
+}
+
+test "terminal detection is conservative and transport can be overridden" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("TERM", "xterm-ghostty");
+    try std.testing.expectEqual(Protocol.kitty, try detectProtocol(&env));
+    try std.testing.expectEqual(Transport.direct, selectTransport(.auto, &env));
+    try env.put("TERM", "tmux-256color");
+    try env.put("TMUX", "/tmp/tmux/default,123,0");
+    try env.put("GHOSTTY_RESOURCES_DIR", "/ghostty");
+    try std.testing.expectEqual(Protocol.kitty, try detectProtocol(&env));
+    try std.testing.expectEqual(Transport.tmux, selectTransport(.auto, &env));
+    try std.testing.expectEqual(Transport.direct, selectTransport(.direct, &env));
+}
+
+test "Space fallback, explicit hold and release, and quit keys" {
+    var ui: Ui = undefined;
+    ui.pending_input_len = 0;
+    ui.io = std.testing.io;
+    ui.in_tmux = true;
+    ui.button_release_deadline_ns = null;
+    var bus = bus_mod.Bus{};
+    try std.testing.expect(ui.processInput(&bus, " "));
+    try std.testing.expect(bus.button_pressed);
+    const deadline = ui.button_release_deadline_ns.?;
+    ui.expireButton(&bus, deadline - 1);
+    try std.testing.expect(bus.button_pressed);
+    ui.expireButton(&bus, deadline);
+    try std.testing.expect(!bus.button_pressed);
+    try std.testing.expect(ui.processInput(&bus, "\x1b[32;1:1u"));
+    try std.testing.expect(ui.button_release_deadline_ns != null);
+    try std.testing.expect(ui.processInput(&bus, "\x1b[32;1:3u"));
+    try std.testing.expect(!bus.button_pressed);
+    ui.in_tmux = false;
+    try std.testing.expect(ui.processInput(&bus, "\x1b[32;1:1u"));
+    try std.testing.expect(ui.button_release_deadline_ns == null);
+    try std.testing.expect(ui.processInput(&bus, "\x1b[32;1:3u"));
+    try std.testing.expect(ui.processInput(&bus, "d"));
+    ui.expireButton(&bus, std.math.maxInt(i96));
+    try std.testing.expect(bus.button_pressed);
+    try std.testing.expect(ui.processInput(&bus, "u"));
+    try std.testing.expect(!bus.button_pressed);
+    for ([_][]const u8{ "q", "\x1b", "\x03", "\x1b[99;5u" }) |key| try std.testing.expect(!ui.processInput(&bus, key));
+}
+
+test "native capability reply preserves adjacent user input" {
+    var input: [128]u8 = undefined;
+    const reply = "d\x1b_Gi=2147483646;OK\x1b\\u";
+    @memcpy(input[0..reply.len], reply);
+    var len = reply.len;
+    try std.testing.expectEqual(true, takeProbeReply(&input, &len).?);
+    try std.testing.expectEqualStrings("du", input[0..len]);
+}
+
+test "fragmented CSI keys and delayed capability replies are consumed safely" {
+    var ui: Ui = undefined;
+    ui.pending_input_len = 0;
+    var bus = bus_mod.Bus{};
+    try std.testing.expect(ui.processInput(&bus, "\x1b["));
+    try std.testing.expect(ui.processInput(&bus, "1;1:1C"));
+    try std.testing.expectEqual(@as(u3, 1), bus.rotary_phase);
+    try std.testing.expect(ui.processInput(&bus, "\x1b_Gi=2147483646;"));
+    try std.testing.expect(ui.processInput(&bus, "OK\x1b\\"));
+    try std.testing.expectEqual(@as(usize, 0), ui.pending_input_len);
+}
+
+test "unknown terminal requires explicit graphics selection" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("TERM", "xterm-256color");
+    try std.testing.expectError(error.UnknownGraphicsCapability, detectProtocol(&env));
+    try env.put("TERM", "xterm-sixel");
+    try std.testing.expectEqual(Protocol.sixel, try detectProtocol(&env));
+    try env.put("TERM", "xterm-kitty");
+    try std.testing.expectEqual(Protocol.kitty, try detectProtocol(&env));
+}
+
+test "unchanged OLED VRAM performs no writes or uploads" {
+    var ui: Ui = undefined;
+    ui.has_presented_frame = true;
+    ui.frames_presented = 4;
+    ui.bytes_written = 100;
+    ui.last_vram = @splat(0);
+    const bus = bus_mod.Bus{};
+    try ui.present(&bus);
+    try std.testing.expectEqual(@as(u64, 4), ui.frames_presented);
+    try std.testing.expectEqual(@as(u64, 100), ui.bytes_written);
+}
+
+test "left arrow and enhanced explicit button hold controls" {
+    var ui: Ui = undefined;
+    ui.pending_input_len = 0;
+    ui.in_tmux = true;
+    var bus = bus_mod.Bus{};
+    try std.testing.expect(ui.processInput(&bus, "\x1b[D"));
+    try std.testing.expectEqual(@as(i2, -1), bus.rotary_active);
+    try std.testing.expect(ui.processInput(&bus, "\x1b[100;1:1u"));
+    try std.testing.expect(bus.button_pressed);
+    ui.expireButton(&bus, std.math.maxInt(i96));
+    try std.testing.expect(bus.button_pressed);
+    try std.testing.expect(ui.processInput(&bus, "\x1b[117;1:1u"));
+    try std.testing.expect(!bus.button_pressed);
 }

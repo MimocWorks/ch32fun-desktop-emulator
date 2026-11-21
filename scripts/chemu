@@ -86,4 +86,4 @@ core=${CHEMU_CORE:-"$script_dir/chemu-core"}
     exit 1
 }
 
-exec "$core" --elf "$firmware" --graphics kitty --target-fps 60 "$@"
+exec "$core" --elf "$firmware" --graphics auto --target-fps 60 "$@"
